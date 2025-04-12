@@ -892,7 +892,7 @@ optional<std::pair<float, float>> SEN66Component::get_sht_heater_measurements() 
     return {};
   }
   // Check if values are valid (not NAN) which indicates heating finished
-  if (isnan(humidity) || isnan(temperature)) {
+  if (std::isnan(humidity) || std::isnan(temperature)) {
     ESP_LOGD(TAG, "SHT heater measurement not ready yet (returned invalid).");
     // Return empty optional, user should retry shortly.
     return {};
@@ -950,6 +950,22 @@ bool SEN66Component::start_fan_cleaning() {
 
   ESP_LOGI(TAG, "Fan cleaning sequence finished.");
   return true;
+}
+
+void SEN66Component::set_temperature_compensation(float offset, float normalized_offset_slope, uint16_t time_constant,
+                                                  uint16_t slot) {
+  if (slot > 4) {
+    ESP_LOGW(TAG, "Invalid temperature compensation slot %d, must be 0-4. Ignoring.", slot);
+    return;
+  }
+  TemperatureCompensation temp_comp;
+  temp_comp.offset = offset * 200;
+  temp_comp.normalized_offset_slope = normalized_offset_slope * 10000;
+  temp_comp.time_constant = time_constant;
+  temperature_compensation_slot_ = slot;  // Store the slot
+  temperature_compensation_ = temp_comp;
+  // Queued for setup
+  ESP_LOGD(TAG, "Temperature compensation for slot %d queued for setup.", slot);
 }
 
 }  // namespace sen66

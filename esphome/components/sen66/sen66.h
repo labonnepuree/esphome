@@ -10,7 +10,7 @@ namespace esphome {
 namespace sen66 {
 
 // Add the SEN66 Command IDs from the official header
-typedef enum {
+typedef enum : uint16_t {
   SEN66_START_CONTINUOUS_MEASUREMENT_CMD_ID = 0x21,
   SEN66_STOP_MEASUREMENT_CMD_ID = 0x104,
   SEN66_GET_DATA_READY_CMD_ID = 0x202,
@@ -144,18 +144,8 @@ class SEN66Component : public PollingComponent, public sensirion_common::Sensiri
 
   // Update to take slot parameter
   void set_temperature_compensation(float offset, float normalized_offset_slope, uint16_t time_constant,
-                                    uint16_t slot = 0) {
-    if (slot > 4) {
-      ESP_LOGW(TAG, "Invalid temperature compensation slot %d, must be 0-4. Ignoring.", slot);
-      return;
-    }
-    TemperatureCompensation temp_comp;
-    temp_comp.offset = offset * 200;
-    temp_comp.normalized_offset_slope = normalized_offset_slope * 10000;
-    temp_comp.time_constant = time_constant;
-    temperature_compensation_slot_ = slot;  // Store the slot
-    temperature_compensation_ = temp_comp;
-  }
+                                    uint16_t slot = 0);
+
   // Add Temperature Acceleration parameters
   void set_temperature_acceleration_parameters(uint16_t k, uint16_t p, uint16_t t1, uint16_t t2);
   // Add VOC algorithm state methods
