@@ -100,7 +100,6 @@ GAS_SENSOR_TUNING = cv.Schema(
 
 # Schema for the VOC sensor allowing tuning parameters
 VOC_SENSOR_SCHEMA = sensor.sensor_schema(
-    unit_of_measurement=None,  # No unit
     icon=ICON_CHEMICAL_WEAPON,
     accuracy_decimals=1,  # Default accuracy
     device_class=DEVICE_CLASS_VOLATILE_ORGANIC_COMPOUNDS,
@@ -111,7 +110,6 @@ VOC_SENSOR_SCHEMA = sensor.sensor_schema(
 
 # Schema for the NOx sensor allowing tuning parameters
 NOX_SENSOR_SCHEMA = sensor.sensor_schema(
-    unit_of_measurement=None,  # No unit
     icon=ICON_CHEMICAL_WEAPON,
     accuracy_decimals=1,  # Default accuracy
     device_class=DEVICE_CLASS_AQI,
