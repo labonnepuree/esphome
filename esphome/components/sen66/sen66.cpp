@@ -946,6 +946,7 @@ bool SEN66Component::start_fan_cleaning() {
   delay(10100);  // Add 100ms margin
 
   // --- Restart Measurement ---
+  ESP_LOGD(TAG, "Restarting measurement after fan cleaning...");
   this->restart_measurement_if_needed_(original_interval);
 
   ESP_LOGI(TAG, "Fan cleaning sequence finished.");
