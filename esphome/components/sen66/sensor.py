@@ -368,7 +368,7 @@ async def sen66_heater_to_code(config, action_id, template_arg, args):
 SEN66_FRC_ACTION_SCHEMA = cv.Schema(  # Schema for the action arguments
     {
         cv.Required(CONF_ID): cv.use_id(SEN66Component),  # Need component ID here
-        cv.Required(CONF_TARGET_CO2_CONCENTRATION): cv.positive_int,
+        cv.Required(CONF_TARGET_CO2_CONCENTRATION): cv.templatable(cv.positive_int),
     }
 )
 
