@@ -1039,5 +1039,80 @@ void SEN66Component::set_temperature_compensation(float offset, float normalized
   ESP_LOGD(TAG, "Temperature compensation for slot %d queued for setup.", slot);
 }
 
+// --- Configuration Setters/Getters ---
+
+void SEN66Component::set_co2_automatic_self_calibration(bool enable) {
+  this->co2_asc_enabled_ = enable;
+  // Configuration is applied during setup(). If called dynamically while running,
+  // it would require stopping measurement, setting, and restarting.
+  ESP_LOGD(TAG, "CO2 ASC status (%s) queued - will be applied during next setup/restart.", ONOFF(enable));
+}
+
+optional<bool> SEN66Component::get_co2_automatic_self_calibration() {
+  bool enabled;
+  // This command works in MEASURING or IDLE state according to Sensirion C driver.
+  if (!this->read_co2_asc_status_(enabled)) {
+    return {};
+  }
+  return enabled;
+}
+
+void SEN66Component::set_ambient_pressure(uint16_t ambient_pressure) {
+  if (ambient_pressure < 700 || ambient_pressure > 1200) {
+    ESP_LOGW(TAG, "Ambient pressure %u hPa outside valid range (700-1200), ignoring.", ambient_pressure);
+    this->ambient_pressure_hpa_.reset();  // Reset if invalid
+    return;
+  }
+  this->ambient_pressure_hpa_ = ambient_pressure;
+
+  // Try to apply immediately if already initialized and measuring/idle,
+  // as this command works during measurement.
+  if (this->initialized_ && (this->current_state_ == MEASURING || this->current_state_ == IDLE)) {
+    ESP_LOGD(TAG, "Attempting to apply ambient pressure (%u hPa) dynamically...", ambient_pressure);
+    if (!this->write_ambient_pressure_(ambient_pressure)) {
+      ESP_LOGW(TAG, "Failed to apply ambient pressure dynamically. It will be applied during next setup/restart.");
+    } else {
+      ESP_LOGD(TAG, "Dynamically applied ambient pressure.");
+    }
+  } else {
+    // Otherwise, queue for setup
+    ESP_LOGD(TAG, "Ambient pressure (%u hPa) queued - will be applied during next setup/restart.", ambient_pressure);
+  }
+}
+
+optional<uint16_t> SEN66Component::get_ambient_pressure() {
+  uint16_t pressure;
+  // This command works in MEASURING or IDLE state according to Sensirion C driver.
+  if (!this->read_ambient_pressure_(pressure)) {
+    return {};
+  }
+  return pressure;
+}
+
+void SEN66Component::set_sensor_altitude(uint16_t altitude) {
+  if (altitude > 3000) {  // Valid range 0-3000m according to SCD4x datasheet (likely similar)
+    ESP_LOGW(TAG, "Sensor altitude %u m outside typical valid range (0-3000), ignoring.", altitude);
+    this->sensor_altitude_m_.reset();
+    return;
+  }
+  this->sensor_altitude_m_ = altitude;
+  // Configuration is only applied during setup(), as the write command requires IDLE state.
+  ESP_LOGD(TAG, "Sensor altitude (%u m) queued - will be applied during next setup/restart.", altitude);
+}
+
+optional<uint16_t> SEN66Component::get_sensor_altitude() {
+  uint16_t altitude;
+  // This command requires IDLE state according to Sensirion C driver.
+  if (this->current_state_ != IDLE) {
+    ESP_LOGW(TAG, "Cannot get sensor altitude while component is not in IDLE state (current: %d).",
+             this->current_state_);
+    return {};
+  }
+  if (!this->read_sensor_altitude_(altitude)) {
+    return {};
+  }
+  return altitude;
+}
+
 }  // namespace sen66
 }  // namespace esphome
