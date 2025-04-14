@@ -21,6 +21,10 @@ template<typename T> float sensirion_invalid_to_nan(T value, T invalid_value) {
 
 void SEN66Component::setup() {
   ESP_LOGCONFIG(TAG, "Setting up SEN66...");
+  // --- Initial State Setup ---
+  this->current_state_ = IDLE;                 // Start in IDLE state before initialization.
+  this->original_interval_before_action_ = 0;  // Reset stored interval, not relevant here yet.
+  this->next_update_allowed_time_ = 0;         // Reset stabilization timer.
 
   // Add explicit device reset based on official example
   ESP_LOGD(TAG, "Performing device reset...");
@@ -194,14 +198,22 @@ void SEN66Component::setup() {
   if (!this->write_command(SEN66_START_CONTINUOUS_MEASUREMENT_CMD_ID)) {
     ESP_LOGE(TAG, "Error starting continuous measurements.");
     this->mark_failed();
+    this->current_state_ = IDLE;  // Remain IDLE if start fails
     return;
   }
+  // --- State Transition: IDLE -> MEASURING ---
+  this->current_state_ = MEASURING;  // Successfully started measuring.
+  // Set initial stabilization delay: update() will wait before first read.
+  this->next_update_allowed_time_ =
+      std::max(millis() + 1200, this->next_update_allowed_time_);  // ~1.1s needed for first data.
+  ESP_LOGD(TAG, "Measurement started. Next read allowed after 1200 ms.");
 
   // Measurement start command needs ~1.1s until first data is ready.
   // Update interval should be longer than this.
 
   initialized_ = true;
   ESP_LOGI(TAG, "SEN66 initialized successfully.");
+  // Poller is started automatically by PollingComponent::call_setup()
 }
 
 void SEN66Component::dump_config() {
@@ -277,7 +289,25 @@ void SEN66Component::dump_config() {
 
 void SEN66Component::update() {
   if (!initialized_) {
+    // Component setup failed or not yet complete.
     return;
+  }
+
+  // --- State Check: Only proceed if MEASURING ---
+  // This prevents attempting reads while sensor is stopped for actions
+  // or during the waiting periods scheduled by set_timeout.
+  if (this->current_state_ != MEASURING) {
+    ESP_LOGVV(TAG, "Skipping update: Component not in MEASURING state (current: %d)", this->current_state_);
+    return;
+  }
+
+  // --- Stabilization Check ---
+  // After starting measurement (in setup or handle_action_completion_), a delay is needed
+  // before the first valid reading. This check enforces that delay non-blockingly.
+  if (millis() < this->next_update_allowed_time_) {
+    ESP_LOGV(TAG, "Waiting for sensor stabilization period to complete... (Remaining: %u ms)",
+             this->next_update_allowed_time_ - millis());
+    return;  // Skip update cycle until stabilization time is reached
   }
 
   // --- Add error handling wrapper ---
@@ -414,25 +444,45 @@ void SEN66Component::update() {
     }
   }
 
-  // Optional: Save VOC state periodically if needed
   // This logic replaces the old baseline saving
   // Trigger e.g., every hour? This needs careful consideration regarding flash wear.
   // Example: save every 3600 seconds (1 hour)
-  // static uint32_t last_voc_save_time = 0;
-  // if (this->voc_sensor_ && millis() - last_voc_save_time > 3600000) {
-  //    auto current_state_opt = this->get_voc_algorithm_state();
-  //    if (current_state_opt.has_value()) {
-  //        // Convert std::vector to uint8_t array for saving
-  //        uint8_t state_to_save[8];
-  //        memcpy(state_to_save, current_state_opt.value().data(), 8);
-  //        if (this->pref_.save(&state_to_save)) {
-  //             ESP_LOGI(TAG, "Periodically saved VOC algorithm state.");
-  //             last_voc_save_time = millis();
-  //        } else {
-  //             ESP_LOGW(TAG, "Failed to periodically save VOC algorithm state.");
-  //        }
-  //    }
-  // }
+  static uint32_t last_voc_save_time = 0;         // Use static to preserve value across calls
+  const uint32_t voc_save_interval_ms = 3600000;  // 1 hour
+
+  if (this->voc_sensor_ && (millis() - last_voc_save_time > voc_save_interval_ms || last_voc_save_time == 0)) {
+    // Pref object is only created if voc_sensor_ exists, so this check is sufficient.
+    ESP_LOGD(TAG, "Attempting periodic VOC algorithm state save (Interval: %u ms)...", voc_save_interval_ms);
+    auto current_state_opt = this->get_voc_algorithm_state();
+    if (current_state_opt.has_value()) {
+      // Convert std::vector to uint8_t array for saving
+      if (current_state_opt.value().size() == 8) {
+        uint8_t state_to_save[8];
+        memcpy(state_to_save, current_state_opt.value().data(), 8);
+
+        // Debug log the state being saved
+        ESP_LOGD(TAG, "State to save: %02X %02X %02X %02X %02X %02X %02X %02X", state_to_save[0], state_to_save[1],
+                 state_to_save[2], state_to_save[3], state_to_save[4], state_to_save[5], state_to_save[6],
+                 state_to_save[7]);
+
+        if (this->pref_.save(&state_to_save)) {
+          ESP_LOGI(TAG, "Periodically saved VOC algorithm state.");
+          last_voc_save_time = millis();  // Update last save time only on success
+        } else {
+          ESP_LOGW(TAG, "Failed to periodically save VOC algorithm state (save operation failed).");
+          // Optionally clear last_voc_save_time to retry sooner? Or keep it to avoid hammering flash? Keeping it for
+          // now.
+        }
+      } else {
+        ESP_LOGW(TAG, "Failed to save VOC state: Unexpected state size (%zu).", current_state_opt.value().size());
+      }
+    } else {
+      ESP_LOGW(TAG, "Failed to save VOC state: Could not retrieve current state from sensor.");
+      // Consider if we should update last_voc_save_time here to prevent retrying immediately.
+      // Let's update it to avoid constant failed read attempts if the sensor is unresponsive.
+      last_voc_save_time = millis();
+    }
+  }  // End periodic save logic
 }
 
 // ===================================
@@ -670,201 +720,220 @@ optional<std::vector<uint8_t>> SEN66Component::get_voc_algorithm_state() {
 }
 
 optional<uint16_t> SEN66Component::perform_forced_co2_recalibration(uint16_t target_co2_concentration) {
-  // Requires stopping measurement first
   ESP_LOGI(TAG, "Attempting CO2 Forced Recalibration (FRC) to %u ppm...", target_co2_concentration);
-  bool was_measuring = this->initialized_;  // Check if we were measuring
+
+  // --- State Check: Ensure component is not already busy ---
+  if (this->current_state_ != MEASURING && this->current_state_ != IDLE) {
+    ESP_LOGE(TAG, "Cannot start FRC: Component is busy (state: %d).", this->current_state_);
+    return {};  // Return empty optional immediately
+  }
+
+  bool was_measuring = this->current_state_ == MEASURING;
   if (was_measuring) {
-    ESP_LOGD(TAG, "Stopping measurement for FRC...");
-    if (!this->write_command(SEN66_STOP_MEASUREMENT_CMD_ID)) {
+    // --- State Transition: MEASURING -> IDLE (temporarily) ---
+    // Stop sensor measurement and ESPHome polling before proceeding.
+    if (!this->stop_measurement_if_needed_()) {  // Handles state change to IDLE
       ESP_LOGE(TAG, "Failed to stop measurement for FRC.");
+      // stop_measurement_if_needed handles cleanup if stop fails.
       return {};
     }
-    delay(600);  // Need 600ms delay after stop before FRC command
-  }
+    // --- State Transition: IDLE -> WAITING_FOR_RECALIBRATION_CMD ---
+    // Schedule the command send after the required 600ms delay.
+    this->current_state_ = WAITING_FOR_RECALIBRATION_CMD;        // Set state for the waiting period.
+    this->frc_target_concentration_ = target_co2_concentration;  // Store target for the callback.
+    ESP_LOGD(TAG, "Stopped measurement for FRC. Waiting 600ms before sending command...");
+    this->set_timeout("frc_send_cmd", 600, [this]() {
+      // --- Timeout Callback: Send FRC Command ---
+      ESP_LOGD(TAG, "Sending CO2 FRC command with target %u ppm...", this->frc_target_concentration_.value());
+      if (!this->write_command(SEN66_PERFORM_FORCED_CO2_RECALIBRATION_CMD_ID, &this->frc_target_concentration_.value(),
+                               1)) {
+        ESP_LOGE(TAG, "Failed to send CO2 FRC command.");
+        this->frc_target_concentration_.reset();  // Clear stored target.
+        // --- Action Failed: Trigger Completion Handler (Failure) ---
+        // Immediately attempt to restart measurements/polling if needed.
+        this->handle_action_completion_(false);  // Pass false to indicate FRC send failure.
+        return;
+      }
+      // --- FRC Command Sent: Schedule Result Reading ---
+      // State remains WAITING_FOR_RECALIBRATION_CMD.
+      // Sensor needs ~500ms to process the command.
+      ESP_LOGD(TAG, "FRC command sent. Waiting 500ms for result...");
+      this->set_timeout("frc_read_result", 500, [this]() { this->handle_frc_read_result_(); });
+    });
+    // Return immediately; FRC is asynchronous. Result is handled by callbacks.
+    return {};  // Return empty optional as result isn't available yet.
 
+  } else {  // Already IDLE
+    // --- State Transition: IDLE -> WAITING_FOR_RECALIBRATION_CMD ---
+    // Can send command immediately as component is idle.
+    ESP_LOGD(TAG, "Component already IDLE. Sending FRC command directly...");
+    if (!this->write_command(SEN66_PERFORM_FORCED_CO2_RECALIBRATION_CMD_ID, &target_co2_concentration, 1)) {
+      ESP_LOGE(TAG, "Failed to send CO2 FRC command while IDLE.");
+      this->current_state_ = IDLE;  // Remain IDLE on failure.
+      return {};
+    }
+    // --- FRC Command Sent: Schedule Result Reading ---
+    this->current_state_ = WAITING_FOR_RECALIBRATION_CMD;
+    this->frc_target_concentration_ = target_co2_concentration;  // Store target.
+    ESP_LOGD(TAG, "FRC command sent. Waiting 500ms for result...");
+    this->set_timeout("frc_read_result", 500, [this]() { this->handle_frc_read_result_(); });
+    // Return immediately; FRC is asynchronous.
+    return {};  // Return empty optional as result isn't available yet.
+  }
+  // NOTE: The function now returns optional<uint16_t>{} immediately in async cases.
+  // The actual result (correction factor) is only logged internally when the
+  // callback completes. If the caller needs the result, the API would need
+  // redesign (e.g., using a lambda callback provided by the caller).
+}
+
+// --- Timeout Callback: Read FRC Result ---
+void SEN66Component::handle_frc_read_result_() {
   uint16_t correction_raw;
-  // FRC requires sending the target concentration with the command
-  // Use write_command, then wait for processing, then read_data
-  if (!this->write_command(SEN66_PERFORM_FORCED_CO2_RECALIBRATION_CMD_ID, &target_co2_concentration, 1)) {
-    ESP_LOGE(TAG, "Failed to send CO2 FRC command.");
-    // Attempt to restart measurement if we stopped it
-    if (was_measuring) {
-      ESP_LOGD(TAG, "Restarting measurement after failed FRC command send...");
-      this->write_command(SEN66_START_CONTINUOUS_MEASUREMENT_CMD_ID);
-    }
-    return {};
-  }
-  // Wait for the calibration to complete (datasheet: ~500 ms)
-  delay(500);
-
-  // Read the correction factor result (1 word)
+  ESP_LOGD(TAG, "Reading CO2 FRC result...");
   if (!this->read_data(&correction_raw, 1)) {
-    ESP_LOGE(TAG, "Failed to perform CO2 FRC command.");
-    // Attempt to restart measurement if we stopped it
-    if (was_measuring) {
-      ESP_LOGD(TAG, "Restarting measurement after failed FRC command read...");
-      this->write_command(SEN66_START_CONTINUOUS_MEASUREMENT_CMD_ID);
-    }
-    return {};
+    ESP_LOGE(TAG, "Failed to read CO2 FRC result.");
+    this->frc_target_concentration_.reset();
+    // --- Action Failed: Trigger Completion Handler (Failure) ---
+    this->handle_action_completion_(false);  // Attempt restart despite read failure.
+    return;
   }
 
-  // Restart measurement if we stopped it
-  if (was_measuring) {
-    ESP_LOGD(TAG, "Restarting measurement after FRC...");
-    if (!this->write_command(SEN66_START_CONTINUOUS_MEASUREMENT_CMD_ID)) {
-      ESP_LOGW(TAG, "Failed to restart measurement after FRC.");
-      this->initialized_ = false;  // Mark as not initialized if restart fails
-    }
-  }
+  this->frc_target_concentration_.reset();  // Clear stored target.
 
   if (correction_raw == 0xFFFF) {
     ESP_LOGE(TAG, "CO2 FRC failed (sensor returned 0xFFFF).");
-    return {};
-  }
-
-  int16_t correction = (int16_t) correction_raw - 0x8000;
-  ESP_LOGI(TAG, "CO2 FRC successful. Correction applied: %d ppm", correction);
-  return correction_raw;  // Return the raw value as per official header
-}
-
-void SEN66Component::set_co2_automatic_self_calibration(bool enable) {
-  this->co2_asc_enabled_ = enable;
-  // Applied during setup
-  ESP_LOGD(TAG, "CO2 ASC status (%s) queued for setup.", ONOFF(enable));
-}
-
-optional<bool> SEN66Component::get_co2_automatic_self_calibration() {
-  bool enabled;
-  if (!this->read_co2_asc_status_(enabled)) {
-    return {};
-  }
-  return enabled;
-}
-
-void SEN66Component::set_ambient_pressure(uint16_t ambient_pressure) {
-  if (ambient_pressure < 700 || ambient_pressure > 1200) {
-    ESP_LOGW(TAG, "Ambient pressure %u hPa outside valid range (700-1200), ignoring.", ambient_pressure);
-    this->ambient_pressure_hpa_.reset();  // Reset if invalid
-    return;
-  }
-  this->ambient_pressure_hpa_ = ambient_pressure;
-  // Try to apply immediately as command works during measurement
-  if (this->initialized_) {
-    if (!this->write_ambient_pressure_(ambient_pressure)) {
-      ESP_LOGW(TAG, "Failed to apply ambient pressure dynamically.");
-    }
+    // --- Action Failed (Sensor Indicated): Trigger Completion Handler (Failure) ---
+    this->handle_action_completion_(false);  // Attempt restart.
   } else {
-    ESP_LOGD(TAG, "Ambient pressure (%u hPa) queued for setup.", ambient_pressure);
+    // --- Action Succeeded: Log Result ---
+    int16_t correction = (int16_t) correction_raw - 0x8000;
+    ESP_LOGI(TAG, "CO2 FRC successful. Correction applied: %d ppm", correction);
+    // --- Action Succeeded: Trigger Completion Handler (Success) ---
+    this->handle_action_completion_(true);  // Proceed to restart measurement.
   }
 }
 
-optional<uint16_t> SEN66Component::get_ambient_pressure() {
-  uint16_t pressure;
-  if (!this->read_ambient_pressure_(pressure)) {
-    return {};
-  }
-  return pressure;
-}
-
-void SEN66Component::set_sensor_altitude(uint16_t altitude) {
-  if (altitude > 3000) {  // Valid range 0-3000m
-    ESP_LOGW(TAG, "Sensor altitude %u m outside valid range (0-3000), ignoring.", altitude);
-    this->sensor_altitude_m_.reset();
-    return;
-  }
-  this->sensor_altitude_m_ = altitude;
-  // Applied during setup
-  ESP_LOGD(TAG, "Sensor altitude (%u m) queued for setup.", altitude);
-}
-
-optional<uint16_t> SEN66Component::get_sensor_altitude() {
-  uint16_t altitude;
-  // This command only works in idle mode according to datasheet
-  if (this->initialized_) {
-    ESP_LOGW(TAG, "Cannot get sensor altitude while measuring.");
-    return {};
-  }
-  if (!this->read_sensor_altitude_(altitude)) {
-    return {};
-  }
-  return altitude;
-}
-
-// Internal helper to stop measurement if needed, returning original interval
-uint32_t SEN66Component::stop_measurement_if_needed_() {
+// Internal helper to stop measurement if needed.
+// Manages state transitions: MEASURING -> IDLE.
+// Stops the ESPHome poller if it was running.
+bool SEN66Component::stop_measurement_if_needed_() {
   if (!this->initialized_) {
     ESP_LOGW(TAG, "Stop measurement requested but component not initialized.");
-    return 0;
+    return false;
   }
 
-  uint32_t original_interval = this->get_update_interval();
-  bool was_polling = original_interval > 0;
+  // --- State Check: Already Idle? ---
+  if (this->current_state_ != MEASURING) {
+    ESP_LOGD(TAG, "Stop measurement requested, but not currently measuring (state: %d). Assuming already stopped.",
+             this->current_state_);
+    // Ensure interval store is cleared if we were in a waiting state previously
+    this->original_interval_before_action_ = 0;
+    return true;  // Treat as success if not measuring.
+  }
 
+  // --- Store Polling State --- Store interval *before* stopping.
+  this->original_interval_before_action_ = this->get_update_interval();
+  bool was_polling = this->original_interval_before_action_ > 0;
+
+  ESP_LOGD(TAG, "Stopping measurement%s...", was_polling ? " and polling" : "");
+
+  // --- Stop Sensor ---
+  if (!this->write_command(SEN66_STOP_MEASUREMENT_CMD_ID)) {
+    ESP_LOGE(TAG, "Failed to send stop measurement command! State uncertain.");
+    // Don't change state or stop poller if sensor command failed.
+    // Clear stored interval as the action cannot proceed correctly.
+    this->original_interval_before_action_ = 0;
+    return false;  // Indicate failure.
+  }
+  // Required small delay after stop command.
+  delay(50);  // Wait after stop command.
+
+  // --- Stop Poller (if active) ---
   if (was_polling) {
-    ESP_LOGD(TAG, "Stopping polling and measurement...");
-    this->set_update_interval(0);  // Stop polling
-    delay(50);                     // Allow potential ongoing update to finish? Small safety delay.
-
-    if (!this->write_command(SEN66_STOP_MEASUREMENT_CMD_ID)) {
-      ESP_LOGE(TAG, "Failed to stop measurement! Restoring polling interval.");
-      this->set_update_interval(original_interval);  // Restore polling
-      return 0;                                      // Indicate failure by returning 0 interval
-    }
-    delay(50);  // Wait after stop command
-    ESP_LOGD(TAG, "Measurement stopped.");
-  } else {
-    ESP_LOGD(TAG, "Component already idle.");
+    this->stop_poller();
+    ESP_LOGD(TAG, "Polling stopped.");
   }
-  return original_interval;  // Return original interval (0 if was idle)
+
+  // --- State Transition: MEASURING -> IDLE ---
+  this->current_state_ = IDLE;
+  ESP_LOGD(TAG, "Measurement stopped. Component state set to IDLE.");
+  return true;  // Indicate success.
 }
 
-// Internal helper to restart measurement if polling was active
-void SEN66Component::restart_measurement_if_needed_(uint32_t original_interval) {
-  if (original_interval > 0) {  // Only restart if it was polling before
-    ESP_LOGD(TAG, "Restarting continuous measurement...");
+// Internal helper to handle completion of asynchronous actions.
+// Manages state transitions back to MEASURING or IDLE.
+// Restarts the ESPHome poller if it was previously active.
+void SEN66Component::handle_action_completion_(bool action_step_success) {
+  auto previous_state = this->current_state_;  // For logging.
+  ESP_LOGD(TAG, "Handling action completion (previous state: %d, success flag: %d)...", previous_state,
+           action_step_success);  // 'success' refers to the last step of the action itself.
+
+  // --- Restart Logic --- Check if polling was active before the action.
+  if (this->original_interval_before_action_ > 0) {
+    // --- Attempt to Restart Sensor ---
+    ESP_LOGD(TAG, "Attempting to restart continuous measurement...");
     if (!this->write_command(SEN66_START_CONTINUOUS_MEASUREMENT_CMD_ID)) {
-      ESP_LOGE(TAG, "Failed to restart measurement! Polling will not resume automatically.");
-      // Mark failed? Component might recover, just leave polling off.
+      ESP_LOGE(TAG, "Failed to send start measurement command! Polling will not resume.");
+      // --- State Transition: WAITING_* -> IDLE (Restart Failed) ---
+      this->current_state_ = IDLE;                 // Remain IDLE if start fails.
+      this->original_interval_before_action_ = 0;  // Clear stored interval.
+      this->next_update_allowed_time_ = 0;         // Clear stabilization timer.
       return;
     }
-    ESP_LOGD(TAG, "Restarting polling...");
-    this->set_update_interval(original_interval);
+
+    // --- State Transition: WAITING_* -> MEASURING (Restart Succeeded) ---
+    this->current_state_ = MEASURING;
+    // Set stabilization delay for the upcoming update() calls.
+    this->next_update_allowed_time_ = millis() + 1200;  // ~1.1s needed.
+    ESP_LOGD(TAG, "Measurement restarted. Next read allowed after 1200 ms.");
+
+    // --- Restart Poller ---
+    ESP_LOGD(TAG, "Restarting polling with interval %u ms...", this->original_interval_before_action_);
+    this->set_update_interval(this->original_interval_before_action_);
+    this->start_poller();
+    this->original_interval_before_action_ = 0;  // Clear stored interval after successful restart.
+
   } else {
-    ESP_LOGD(TAG, "No polling restart needed (was idle).");
+    // --- State Transition: WAITING_* -> IDLE (Polling Was Not Active) ---
+    // If polling was not active before the action, we should remain IDLE.
+    ESP_LOGD(TAG, "Polling was not active before the action, remaining in IDLE state.");
+    this->current_state_ = IDLE;
+    this->next_update_allowed_time_ = 0;  // Not measuring, so no stabilization needed.
   }
 }
 
 bool SEN66Component::activate_sht_heater() {
-  if (!this->initialized_) {
-    ESP_LOGE(TAG, "Cannot activate SHT heater: Component not initialized.");
+  // --- State Check: Ensure component is not already busy ---
+  if (this->current_state_ != MEASURING && this->current_state_ != IDLE) {
+    ESP_LOGE(TAG, "Cannot activate SHT heater: Component is busy (state: %d).", this->current_state_);
     return false;
   }
 
-  ESP_LOGI(TAG, "Starting SHT heater activation sequence...");
+  ESP_LOGI(TAG, "Starting SHT heater activation sequence (non-blocking)...");
 
-  uint32_t original_interval = this->stop_measurement_if_needed_();
-  if (original_interval == 0 && this->get_update_interval() > 0) {  // Check if stop failed but was polling
+  // --- State Transition: MEASURING -> IDLE (temporarily) ---
+  if (!this->stop_measurement_if_needed_()) {
     ESP_LOGE(TAG, "Failed to enter idle mode for heater activation.");
     return false;
   }
 
-  // --- Activate Heater ---
+  // --- Activate Heater --- (Component is now IDLE)
+  ESP_LOGD(TAG, "Sending activate SHT heater command...");
   if (!write_command(SEN66_ACTIVATE_SHT_HEATER_CMD_ID)) {
-    ESP_LOGE(TAG, "Failed to activate SHT heater. Err=%d", this->last_error_);
-    this->restart_measurement_if_needed_(original_interval);  // Attempt to restart if needed
+    ESP_LOGE(TAG, "Failed to send activate SHT heater command. Err=%d", this->last_error_);
+    // --- Action Failed: Trigger Completion Handler (Failure) ---
+    this->handle_action_completion_(false);  // Attempt restart immediately.
     return false;
   }
-  ESP_LOGI(TAG, "SHT heater activated for 1 second.");
-  // According to official documentation, we need to wait at least 20s after this command
-  // before starting a measurement to get coherent temperature values (for heating
-  // consequence to disappear).
-  delay(20000);  // 20s
 
-  // --- Restart Measurement ---
-  this->restart_measurement_if_needed_(original_interval);
+  // --- Schedule Completion --- (Heater needs 20s cooldown before restart)
+  ESP_LOGI(TAG, "SHT heater command sent. Waiting 20 seconds before restarting measurement...");
+  // --- State Transition: IDLE -> WAITING_FOR_HEATER ---
+  this->current_state_ = WAITING_FOR_HEATER;
+  // Schedule the completion handler to run after the cooldown period.
+  this->set_timeout("heater_complete", 20000, [this]() { this->handle_action_completion_(true); });
 
-  ESP_LOGI(TAG, "SHT heater sequence finished.");
-  return true;
+  return true;  // Activation initiated successfully, will complete asynchronously.
 }
 
 optional<std::pair<float, float>> SEN66Component::get_sht_heater_measurements() {
@@ -920,37 +989,38 @@ optional<sen66_device_status> SEN66Component::read_and_clear_device_status() {
 }
 
 bool SEN66Component::start_fan_cleaning() {
-  if (!this->initialized_) {
-    ESP_LOGE(TAG, "Cannot start fan cleaning: Component not initialized.");
+  // --- State Check: Ensure component is not already busy ---
+  if (this->current_state_ != MEASURING && this->current_state_ != IDLE) {
+    ESP_LOGE(TAG, "Cannot start fan cleaning: Component is busy (state: %d).", this->current_state_);
     return false;
   }
 
-  ESP_LOGI(TAG, "Starting fan cleaning sequence...");
+  ESP_LOGI(TAG, "Starting fan cleaning sequence (non-blocking)...");
 
-  uint32_t original_interval = this->stop_measurement_if_needed_();
-  if (original_interval == 0 && this->get_update_interval() > 0) {  // Check if stop failed but was polling
+  // --- State Transition: MEASURING -> IDLE (temporarily) ---
+  if (!this->stop_measurement_if_needed_()) {
     ESP_LOGE(TAG, "Failed to enter idle mode for fan cleaning.");
     return false;
   }
 
-  // --- Start Cleaning ---
+  // --- Start Cleaning --- (Component is now IDLE)
   ESP_LOGD(TAG, "Sending start fan cleaning command...");
   if (!write_command(SEN66_START_FAN_CLEANING_CMD_ID)) {
-    this->restart_measurement_if_needed_(original_interval);  // Attempt to restart if needed
     ESP_LOGE(TAG, "Start fan cleaning command failed. Err=%d", this->last_error_);
+    // --- Action Failed: Trigger Completion Handler (Failure) ---
+    this->handle_action_completion_(false);  // Attempt restart immediately.
     return false;
   }
 
-  // Fan runs for 10s. Need 10s delay AFTER command before starting measurement.
-  ESP_LOGI(TAG, "Fan cleaning cycle running (10 seconds)... Waiting...");
-  delay(10100);  // Add 100ms margin
+  // --- Schedule Completion --- (Fan runs for 10s)
+  // Need 10s delay AFTER command before restarting measurement.
+  ESP_LOGI(TAG, "Fan cleaning command sent. Waiting 10 seconds before restarting measurement...");
+  // --- State Transition: IDLE -> WAITING_FOR_CLEANING ---
+  this->current_state_ = WAITING_FOR_CLEANING;
+  // Schedule the completion handler to run after the cleaning duration.
+  this->set_timeout("cleaning_complete", 10100, [this]() { this->handle_action_completion_(true); });
 
-  // --- Restart Measurement ---
-  ESP_LOGD(TAG, "Restarting measurement after fan cleaning...");
-  this->restart_measurement_if_needed_(original_interval);
-
-  ESP_LOGI(TAG, "Fan cleaning sequence finished.");
-  return true;
+  return true;  // Cleaning initiated successfully, will complete asynchronously.
 }
 
 void SEN66Component::set_temperature_compensation(float offset, float normalized_offset_slope, uint16_t time_constant,

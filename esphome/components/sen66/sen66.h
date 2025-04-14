@@ -9,6 +9,20 @@
 namespace esphome {
 namespace sen66 {
 
+// State enum for managing component operations
+// This enum defines the possible operational states of the SEN66 component,
+// ensuring that actions like cleaning, heating, or calibration don't conflict
+// with regular measurements or each other.
+enum ComponentState {
+  IDLE,                           // Component is initialized but not actively measuring (poller stopped).
+  MEASURING,                      // Component is actively taking measurements (poller running).
+  WAITING_FOR_CLEANING,           // Fan cleaning command sent, waiting 10s before restarting measurement.
+  WAITING_FOR_HEATER,             // Heater activation command sent, waiting 20s before restarting measurement.
+  WAITING_FOR_RECALIBRATION_CMD,  // FRC initiated, waiting for delays/command completion before reading result.
+  // WAITING_FOR_RECALIBRATION_RESTART // Note: This state was initially considered but combined into
+  // handle_action_completion_
+};
+
 // Add the SEN66 Command IDs from the official header
 typedef enum : uint16_t {
   SEN66_START_CONTINUOUS_MEASUREMENT_CMD_ID = 0x21,
@@ -194,10 +208,53 @@ class SEN66Component : public PollingComponent, public sensirion_common::Sensiri
   bool read_device_status_internal_(uint16_t command, sen66_device_status &status);
 
   // Internal helpers for actions
-  uint32_t stop_measurement_if_needed_();
-  void restart_measurement_if_needed_(uint32_t original_interval);
+
+  /**
+   * @brief Stops the sensor's measurement and the ESPHome poller if active.
+   *
+   * This function is called before performing actions that require the sensor
+   * to be idle (e.g., cleaning, heating, FRC).
+   * It stores the current update interval if polling was active, sends the stop
+   * command to the sensor, stops the ESPHome poller, and sets the component
+   * state to IDLE.
+   *
+   * @return true if measurement was stopped successfully (or was already stopped),
+   *         false if the stop command failed.
+   */
+  bool stop_measurement_if_needed_();  // Now returns bool, handles state internally
+
+  /**
+   * @brief Handles the completion of asynchronous actions (cleaning, heating, FRC).
+   *
+   * This function is scheduled via `set_timeout` by the action initiation functions.
+   * It attempts to restart the sensor's measurement and the ESPHome poller
+   * *only if* polling was active before the action started (indicated by
+   * `original_interval_before_action_ > 0`).
+   * It also sets the `next_update_allowed_time_` to ensure a stabilization period
+   * after restarting measurements.
+   *
+   * @param start_measurement_success Flag indicating if the preceding action step
+   *                                   (like sending a command or reading a result)
+   *                                   was successful. Used mainly for logging/debugging.
+   */
+  void handle_action_completion_(
+      bool start_measurement_success = true);  // New handler for completing actions and restarting
+
+  /**
+   * @brief Specifically handles reading the result after the FRC command processing time.
+   *
+   * This function is scheduled via `set_timeout` within the FRC process.
+   * It reads the correction factor, logs the result (success or failure),
+   * and then calls `handle_action_completion_` to proceed with restarting
+   * measurements if applicable.
+   */
+  void handle_frc_read_result_();  // New handler specifically for FRC result reading
 
   bool initialized_{false};
+  ComponentState current_state_{IDLE};             // Tracks the current operational state of the component.
+  uint32_t original_interval_before_action_{0};    // Stores the polling interval before an action stops it.
+  optional<uint16_t> frc_target_concentration_{};  // Temporarily stores the FRC target during the async operation.
+
   // Mass Concentration Sensors
   sensor::Sensor *pm_1_0_sensor_{nullptr};
   sensor::Sensor *pm_2_5_sensor_{nullptr};
@@ -235,6 +292,11 @@ class SEN66Component : public PollingComponent, public sensirion_common::Sensiri
   // Member variables for error counting
   uint8_t consecutive_update_failures_{0};
   uint8_t max_consecutive_failures_{10};  // Default value, can be overridden by config
+
+  // Timestamp for the earliest next allowed update after stabilization periods
+  // Used after starting measurements (setup, action completion) to ensure the
+  // sensor has stabilized before the update() function reads values.
+  uint32_t next_update_allowed_time_{0};
 };
 
 }  // namespace sen66
