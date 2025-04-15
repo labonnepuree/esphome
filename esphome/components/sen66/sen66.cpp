@@ -15,10 +15,11 @@ namespace sen66 {
 static const char *const TAG = "sen66";
 
 // Helper function to convert Sensirion int16_t/uint16_t invalid values to NAN
-template<typename T> float sensirion_invalid_to_nan(T value, T invalid_value) {
-  return value == invalid_value ? NAN : static_cast<float>(value);
+template<typename T> float sensirion_invalid_to_nan(T value, T invalid_value, float scale = 1.0f) {
+  return value == invalid_value ? NAN : static_cast<float>(value) * scale;
 }
 
+/** @brief Initialize the sensor, read static info, apply configurations, load state, and start measurement. */
 void SEN66Component::setup() {
   ESP_LOGCONFIG(TAG, "Setting up SEN66...");
   // --- Initial State Setup ---
@@ -80,12 +81,16 @@ void SEN66Component::continue_setup_after_stop_() {
     this->mark_failed();
     return;
   }
-  // Store first 4 bytes as per original code structure, log all 8 for info
-  memcpy(this->serial_number_, serial_bytes, 4);
+
+  // Convert serial bytes to hex string
+  char serial_hex[17];  // 8 bytes * 2 hex chars + 1 null terminator
+  sprintf(serial_hex, "%02X%02X%02X%02X%02X%02X%02X%02X", serial_bytes[0], serial_bytes[1], serial_bytes[2],
+          serial_bytes[3], serial_bytes[4], serial_bytes[5], serial_bytes[6], serial_bytes[7]);
+  this->serial_number_ = std::string(serial_hex);
+
   ESP_LOGD(TAG, "Read Serial number bytes: %02X%02X%02X%02X%02X%02X%02X%02X", serial_bytes[0], serial_bytes[1],
            serial_bytes[2], serial_bytes[3], serial_bytes[4], serial_bytes[5], serial_bytes[6], serial_bytes[7]);
-  ESP_LOGI(TAG, "Using Serial number part: %02X%02X%02X%02X", serial_number_[0], serial_number_[1], serial_number_[2],
-           serial_number_[3]);
+  ESP_LOGI(TAG, "Serial number: %s", this->serial_number_.c_str());
 
   char product_name_str[33] = {0};  // Max 32 chars + null terminator
   if (!this->get_register(SEN66_GET_PRODUCT_NAME_CMD_ID, (uint16_t *) product_name_str, 16, 50)) {
@@ -104,13 +109,13 @@ void SEN66Component::continue_setup_after_stop_() {
     return;
   }
   // High byte is major, low byte is minor according to official header function
-  this->firmware_version_ = version_word;  // Store both bytes for now
-  ESP_LOGI(TAG, "Firmware version: %d.%d", (uint8_t) (version_word >> 8), (uint8_t) (version_word & 0xFF));
+  this->version_info_.firmware_major = (uint8_t) (version_word >> 8);
+  this->version_info_.firmware_minor = (uint8_t) (version_word & 0xFF);
+  ESP_LOGI(TAG, "Firmware version: %d.%d", this->version_info_.firmware_major, this->version_info_.firmware_minor);
 
   // --- Apply Configurations ---
-  if (this->temperature_compensation_.has_value()) {
-    if (!this->write_temperature_compensation_(this->temperature_compensation_.value(),
-                                               this->temperature_compensation_slot_)) {
+  if (this->temp_comp_params_.has_value()) {
+    if (!this->write_temperature_compensation_(this->temp_comp_params_.value())) {
       ESP_LOGW(TAG, "Failed to set temperature compensation.");
     }
     delay(20);  // Short delay after config commands
@@ -141,19 +146,37 @@ void SEN66Component::continue_setup_after_stop_() {
     delay(20);
   }
 
-  if (this->temperature_acceleration_.has_value()) {
-    if (!this->write_temperature_acceleration_(this->temperature_acceleration_.value())) {
+  if (this->temp_accel_params_.has_value()) {
+    if (!this->write_temperature_acceleration_(this->temp_accel_params_.value())) {
       ESP_LOGW(TAG, "Failed to set temperature acceleration parameters.");
     }
     delay(20);
   }
 
-  // Initialize preference object
+  // Initialize preference objects
   if (this->voc_sensor_) {  // Only relevant if VOC sensor is configured
     uint32_t combined_serial = encode_uint32(this->serial_number_[0], this->serial_number_[1], this->serial_number_[2],
                                              this->serial_number_[3]);
-    uint32_t hash = fnv1_hash("sen66_" + std::to_string(combined_serial));
-    this->pref_ = global_preferences->make_preference<uint8_t[8]>(hash);
+    uint32_t voc_hash = fnv1_hash("sen66_voc_" + std::to_string(combined_serial));
+    this->voc_state_pref_ = global_preferences->make_preference<uint8_t[8]>(voc_hash, true);
+
+    uint32_t time_hash = fnv1_hash("sen66_voc_time_" + std::to_string(combined_serial));
+    this->last_voc_save_time_pref_ = global_preferences->make_preference<uint32_t>(time_hash, true);
+
+    // Load last VOC save time from preferences
+    ESP_LOGD(TAG, "Attempting to load last VOC save time from preferences...");
+    if (this->last_voc_save_time_pref_.load(&this->last_voc_save_time_)) {
+      ESP_LOGI(TAG, "Loaded last VOC save time from preferences: %" PRIu32 " ms ago",
+               (millis() - this->last_voc_save_time_));
+    } else {
+      ESP_LOGD(TAG, "No saved last VOC save time found in preferences, defaulting to 0.");
+      // Attempt to save the default value (0) immediately if loading failed.
+      // This ensures the preference exists for future updates.
+      if (!this->last_voc_save_time_pref_.save(&this->last_voc_save_time_)) {
+        ESP_LOGW(TAG, "Failed to save default last VOC save time to preferences.");
+        this->mark_failed();  // Mark component failed if initial pref save fails.
+      }
+    }
 
     // Load VOC state from preferences and write to sensor
     ESP_LOGD(TAG, "Attempting to load VOC algorithm state from preferences...");
@@ -205,11 +228,12 @@ void SEN66Component::continue_setup_after_stop_() {
   // Measurement start command needs ~1.1s until first data is ready.
   // Update interval should be longer than this.
 
-  initialized_ = true;
+  this->initialized_ = true;
   ESP_LOGI(TAG, "SEN66 initialized successfully.");
   // Poller is started automatically by PollingComponent::call_setup()
 }
 
+/** @brief Log device information and configuration settings. */
 void SEN66Component::dump_config() {
   ESP_LOGCONFIG(TAG, "SEN66:");
   LOG_I2C_DEVICE(this);
@@ -217,17 +241,16 @@ void SEN66Component::dump_config() {
     ESP_LOGW(TAG, "Component has failed setup and will not work!");
   }
   ESP_LOGCONFIG(TAG, "  Product Name: %s", this->product_name_.c_str());
-  ESP_LOGCONFIG(TAG, "  Firmware Version: %d.%d", (uint8_t) (this->firmware_version_ >> 8),
-                (uint8_t) (this->firmware_version_ & 0xFF));
-  ESP_LOGCONFIG(TAG, "  Serial Number: %02X%02X%02X%02X...", serial_number_[0], serial_number_[1], serial_number_[2],
-                serial_number_[3]);  // Show first 4 bytes
+  ESP_LOGCONFIG(TAG, "  Firmware Version: %d.%d", this->version_info_.firmware_major,
+                this->version_info_.firmware_minor);
+  ESP_LOGCONFIG(TAG, "  Serial Number: %s", this->serial_number_.c_str());
 
   // Log optional configurations if set
-  if (this->temperature_compensation_.has_value()) {
+  if (this->temp_comp_params_.has_value()) {
     ESP_LOGCONFIG(TAG, "  Temperature Compensation: Slot %d, Offset %.2f, Slope %.4f, TC %u",
-                  this->temperature_compensation_slot_, (float) this->temperature_compensation_.value().offset / 200.0f,
-                  (float) this->temperature_compensation_.value().normalized_offset_slope / 10000.0f,
-                  this->temperature_compensation_.value().time_constant);
+                  this->temp_comp_params_.value().slot, (float) this->temp_comp_params_.value().offset / 200.0f,
+                  (float) this->temp_comp_params_.value().normalized_offset_slope / 10000.0f,
+                  this->temp_comp_params_.value().time_constant);
   }
   if (this->voc_tuning_params_.has_value()) {
     ESP_LOGCONFIG(TAG, "  VOC Tuning: IdxOffset %d, LearnOffset %dh, LearnGain %dh, GateMax %dm, StdInit %d, Gain %d",
@@ -245,12 +268,11 @@ void SEN66Component::dump_config() {
                   this->nox_tuning_params_.value().gating_max_duration_minutes,
                   this->nox_tuning_params_.value().std_initial, this->nox_tuning_params_.value().gain_factor);
   }
-  if (this->temperature_acceleration_.has_value()) {
-    ESP_LOGCONFIG(TAG, "  Temperature Acceleration: K %.1f, P %.1f, T1 %.1fs, T2 %.1fs",
-                  (float) this->temperature_acceleration_.value().k / 10.0f,
-                  (float) this->temperature_acceleration_.value().p / 10.0f,
-                  (float) this->temperature_acceleration_.value().t1 / 10.0f,
-                  (float) this->temperature_acceleration_.value().t2 / 10.0f);
+  if (this->temp_accel_params_.has_value()) {
+    ESP_LOGCONFIG(
+        TAG, "  Temperature Acceleration: K %.1f, P %.1f, T1 %.1fs, T2 %.1fs",
+        (float) this->temp_accel_params_.value().k / 10.0f, (float) this->temp_accel_params_.value().p / 10.0f,
+        (float) this->temp_accel_params_.value().t1 / 10.0f, (float) this->temp_accel_params_.value().t2 / 10.0f);
   }
   if (this->co2_asc_enabled_.has_value()) {
     ESP_LOGCONFIG(TAG, "  CO2 Auto Self-Calibration: %s", ONOFF(this->co2_asc_enabled_.value()));
@@ -281,8 +303,9 @@ void SEN66Component::dump_config() {
   LOG_SENSOR("  ", "CO2", this->co2_sensor_);
 }
 
+/** @brief Called periodically by the scheduler to read sensor data. Manages state transitions. */
 void SEN66Component::update() {
-  if (!initialized_) {
+  if (!this->initialized_) {
     // Component setup failed or not yet complete.
     return;
   }
@@ -296,12 +319,13 @@ void SEN66Component::update() {
   }
 
   // --- Stabilization Check ---
-  // After starting measurement (in setup or handle_action_completion_), a delay is needed
-  // before the first valid reading. This check enforces that delay non-blockingly.
-  if (millis() < this->next_update_allowed_time_) {
-    ESP_LOGV(TAG, "Waiting for sensor stabilization period to complete... (Remaining: %u ms)",
+  // Determine if we are in the stabilization period after starting measurement.
+  // During this time, we read data to warm up but don't publish.
+  bool is_stabilizing = millis() < this->next_update_allowed_time_;
+  if (is_stabilizing) {
+    ESP_LOGV(TAG, "Sensor stabilization period active. Reading data but not publishing... (Remaining: %u ms)",
              this->next_update_allowed_time_ - millis());
-    return;  // Skip update cycle until stabilization time is reached
+    // Don't return; proceed to read data.
   }
 
   // --- Add error handling wrapper ---
@@ -317,10 +341,10 @@ void SEN66Component::update() {
   } else if (!(data_ready_word & 0x00FF)) {
     ESP_LOGV(TAG, "Data not ready yet.");
     // Data not ready isn't a failure, reset counter if needed
-    if (this->consecutive_update_failures_ > 0) {
+    if (this->consecutive_failures_ > 0) {
       ESP_LOGD(TAG, "Resetting failure counter as data is not ready (not a failure). Consecutive failures was: %d",
-               this->consecutive_update_failures_);
-      this->consecutive_update_failures_ = 0;
+               this->consecutive_failures_);
+      this->consecutive_failures_ = 0;
     }
     return;  // Exit normally
   }
@@ -340,35 +364,37 @@ void SEN66Component::update() {
         update_successful = false;
       } else {
         // Parse Mass Concentration & Gas values
-        float pm_1_0 = sensirion_invalid_to_nan(mass_gas_values[0], (uint16_t) 0xFFFF) / 10.0f;
-        float pm_2_5 = sensirion_invalid_to_nan(mass_gas_values[1], (uint16_t) 0xFFFF) / 10.0f;
-        float pm_4_0 = sensirion_invalid_to_nan(mass_gas_values[2], (uint16_t) 0xFFFF) / 10.0f;
-        float pm_10_0 = sensirion_invalid_to_nan(mass_gas_values[3], (uint16_t) 0xFFFF) / 10.0f;
-        float humidity = sensirion_invalid_to_nan((int16_t) mass_gas_values[4], (int16_t) 0x7FFF) / 100.0f;
-        float temperature = sensirion_invalid_to_nan((int16_t) mass_gas_values[5], (int16_t) 0x7FFF) / 200.0f;
-        float voc_index = sensirion_invalid_to_nan((int16_t) mass_gas_values[6], (int16_t) 0x7FFF) / 10.0f;
-        float nox_index = sensirion_invalid_to_nan((int16_t) mass_gas_values[7], (int16_t) 0x7FFF) / 10.0f;
+        float pm_1_0 = sensirion_invalid_to_nan(mass_gas_values[0], (uint16_t) 0xFFFF, 10.0f);
+        float pm_2_5 = sensirion_invalid_to_nan(mass_gas_values[1], (uint16_t) 0xFFFF, 10.0f);
+        float pm_4_0 = sensirion_invalid_to_nan(mass_gas_values[2], (uint16_t) 0xFFFF, 10.0f);
+        float pm_10_0 = sensirion_invalid_to_nan(mass_gas_values[3], (uint16_t) 0xFFFF, 10.0f);
+        float humidity = sensirion_invalid_to_nan((int16_t) mass_gas_values[4], (int16_t) 0x7FFF, 100.0f);
+        float temperature = sensirion_invalid_to_nan((int16_t) mass_gas_values[5], (int16_t) 0x7FFF, 200.0f);
+        float voc_index = sensirion_invalid_to_nan((int16_t) mass_gas_values[6], (int16_t) 0x7FFF, 10.0f);
+        float nox_index = sensirion_invalid_to_nan((int16_t) mass_gas_values[7], (int16_t) 0x7FFF, 10.0f);
         float co2 = sensirion_invalid_to_nan(mass_gas_values[8], (uint16_t) 0xFFFF);  // CO2 is direct ppm
 
-        // Publish Mass Concentration & Gas values
-        if (this->pm_1_0_sensor_ != nullptr)
-          this->pm_1_0_sensor_->publish_state(pm_1_0);
-        if (this->pm_2_5_sensor_ != nullptr)
-          this->pm_2_5_sensor_->publish_state(pm_2_5);
-        if (this->pm_4_0_sensor_ != nullptr)
-          this->pm_4_0_sensor_->publish_state(pm_4_0);
-        if (this->pm_10_0_sensor_ != nullptr)
-          this->pm_10_0_sensor_->publish_state(pm_10_0);
-        if (this->humidity_sensor_ != nullptr)
-          this->humidity_sensor_->publish_state(humidity);
-        if (this->temperature_sensor_ != nullptr)
-          this->temperature_sensor_->publish_state(temperature);
-        if (this->voc_sensor_ != nullptr)
-          this->voc_sensor_->publish_state(voc_index);
-        if (this->nox_sensor_ != nullptr)
-          this->nox_sensor_->publish_state(nox_index);
-        if (this->co2_sensor_ != nullptr)
-          this->co2_sensor_->publish_state(co2);
+        // Publish Mass Concentration & Gas values only if not stabilizing
+        if (!is_stabilizing) {
+          if (this->pm_1_0_sensor_ != nullptr)
+            this->pm_1_0_sensor_->publish_state(pm_1_0);
+          if (this->pm_2_5_sensor_ != nullptr)
+            this->pm_2_5_sensor_->publish_state(pm_2_5);
+          if (this->pm_4_0_sensor_ != nullptr)
+            this->pm_4_0_sensor_->publish_state(pm_4_0);
+          if (this->pm_10_0_sensor_ != nullptr)
+            this->pm_10_0_sensor_->publish_state(pm_10_0);
+          if (this->humidity_sensor_ != nullptr)
+            this->humidity_sensor_->publish_state(humidity);
+          if (this->temperature_sensor_ != nullptr)
+            this->temperature_sensor_->publish_state(temperature);
+          if (this->voc_sensor_ != nullptr)
+            this->voc_sensor_->publish_state(voc_index);
+          if (this->nox_sensor_ != nullptr)
+            this->nox_sensor_->publish_state(nox_index);
+          if (this->co2_sensor_ != nullptr)
+            this->co2_sensor_->publish_state(co2);
+        }
       }
     }
 
@@ -388,23 +414,25 @@ void SEN66Component::update() {
           update_successful = false;
         } else {
           // Parse Number Concentration values
-          float nc_0_5 = sensirion_invalid_to_nan(number_values[0], (uint16_t) 0xFFFF) / 10.0f;
-          float nc_1_0 = sensirion_invalid_to_nan(number_values[1], (uint16_t) 0xFFFF) / 10.0f;
-          float nc_2_5 = sensirion_invalid_to_nan(number_values[2], (uint16_t) 0xFFFF) / 10.0f;
-          float nc_4_0 = sensirion_invalid_to_nan(number_values[3], (uint16_t) 0xFFFF) / 10.0f;
-          float nc_10_0 = sensirion_invalid_to_nan(number_values[4], (uint16_t) 0xFFFF) / 10.0f;
+          float nc_0_5 = sensirion_invalid_to_nan(number_values[0], (uint16_t) 0xFFFF, 10.0f);
+          float nc_1_0 = sensirion_invalid_to_nan(number_values[1], (uint16_t) 0xFFFF, 10.0f);
+          float nc_2_5 = sensirion_invalid_to_nan(number_values[2], (uint16_t) 0xFFFF, 10.0f);
+          float nc_4_0 = sensirion_invalid_to_nan(number_values[3], (uint16_t) 0xFFFF, 10.0f);
+          float nc_10_0 = sensirion_invalid_to_nan(number_values[4], (uint16_t) 0xFFFF, 10.0f);
 
-          // Publish Number Concentration values
-          if (this->nc_0_5_sensor_ != nullptr)
-            this->nc_0_5_sensor_->publish_state(nc_0_5);
-          if (this->nc_1_0_sensor_ != nullptr)
-            this->nc_1_0_sensor_->publish_state(nc_1_0);
-          if (this->nc_2_5_sensor_ != nullptr)
-            this->nc_2_5_sensor_->publish_state(nc_2_5);
-          if (this->nc_4_0_sensor_ != nullptr)
-            this->nc_4_0_sensor_->publish_state(nc_4_0);
-          if (this->nc_10_0_sensor_ != nullptr)
-            this->nc_10_0_sensor_->publish_state(nc_10_0);
+          // Publish Number Concentration values only if not stabilizing
+          if (!is_stabilizing) {
+            if (this->nc_0_5_sensor_ != nullptr)
+              this->nc_0_5_sensor_->publish_state(nc_0_5);
+            if (this->nc_1_0_sensor_ != nullptr)
+              this->nc_1_0_sensor_->publish_state(nc_1_0);
+            if (this->nc_2_5_sensor_ != nullptr)
+              this->nc_2_5_sensor_->publish_state(nc_2_5);
+            if (this->nc_4_0_sensor_ != nullptr)
+              this->nc_4_0_sensor_->publish_state(nc_4_0);
+            if (this->nc_10_0_sensor_ != nullptr)
+              this->nc_10_0_sensor_->publish_state(nc_10_0);
+          }
         }
       }
     }
@@ -413,10 +441,10 @@ void SEN66Component::update() {
   // --- Handle success or failure ---
   if (update_successful) {
     // Reset counter on any successful update cycle
-    if (this->consecutive_update_failures_ > 0) {
+    if (this->consecutive_failures_ > 0) {
       ESP_LOGD(TAG, "Successful update, resetting failure counter. Consecutive failures was: %d",
-               this->consecutive_update_failures_);
-      this->consecutive_update_failures_ = 0;
+               this->consecutive_failures_);
+      this->consecutive_failures_ = 0;
     }
     // Clear warning if no issues occurred this cycle
     if (!this->status_has_warning()) {  // Check if *any* part set warning
@@ -424,42 +452,51 @@ void SEN66Component::update() {
     }
   } else {
     // Increment counter on failure
-    this->consecutive_update_failures_++;
-    ESP_LOGW(TAG, "Update failed. Consecutive failures: %d/%d", this->consecutive_update_failures_,
+    this->consecutive_failures_++;
+    ESP_LOGW(TAG, "Update failed. Consecutive failures: %d/%d", this->consecutive_failures_,
              this->max_consecutive_failures_);
 
     // Check if threshold is reached (and feature enabled, check > 0)
-    if (this->max_consecutive_failures_ > 0 && this->consecutive_update_failures_ >= this->max_consecutive_failures_) {
+    if (this->max_consecutive_failures_ > 0 && this->consecutive_failures_ >= this->max_consecutive_failures_) {
       ESP_LOGE(TAG, "Reached maximum consecutive failures (%d). Triggering reboot!", this->max_consecutive_failures_);
-      App.safe_reboot();  // Request a safe reboot
-      // Optionally: delay slightly to allow log transmission
-      delay(500);
-      return;  // Stop further processing this cycle
+      set_timeout("safe_reboot", 500,
+                  []() { App.safe_reboot(); });  // Request a safe reboot after 500ms delay to allow log transmission
+      return;                                    // Stop further processing this cycle
     }
   }
 
   // Trigger VOC state saving periodically.
-  static uint32_t last_voc_save_time = 0;         // Use static to preserve value across calls
-  const uint32_t voc_save_interval_ms = 3600000;  // 1 hour
+  static uint32_t voc_save_interval_ms = 3600000;  // 1 hour
 
-  if (this->voc_sensor_ && (millis() - last_voc_save_time > voc_save_interval_ms || last_voc_save_time == 0)) {
+  if (this->voc_sensor_ &&
+      (millis() - this->last_voc_save_time_ > voc_save_interval_ms || this->last_voc_save_time_ == 0)) {
     // Pref object is only created if voc_sensor_ exists, so this check is sufficient.
-    ESP_LOGD(TAG, "Attempting periodic VOC algorithm state save (Interval: %u ms)...", voc_save_interval_ms);
-    if (this->save_voc_algorithm_state_()) {
-      ESP_LOGI(TAG, "Periodically saved VOC algorithm state.");
-      last_voc_save_time = millis();  // Update last save time only on success
-    } else {
-      ESP_LOGW(TAG, "Failed to periodically save VOC algorithm state.");
-      // Update time even on failure to avoid hammering sensor/flash if there's a persistent issue
-      last_voc_save_time = millis();
-    }
-  }  // End periodic save logic
+    // Also skip saving during stabilization phase
+    if (!is_stabilizing) {
+      ESP_LOGD(TAG, "Attempting periodic VOC algorithm state save (Interval: %u ms)...", voc_save_interval_ms);
+      if (this->save_voc_algorithm_state_()) {
+        ESP_LOGI(TAG, "Periodically saved VOC algorithm state.");
+        this->last_voc_save_time_ = millis();  // Update last save time in memory
+        // Save the updated time to preferences only on successful state save.
+        if (!this->last_voc_save_time_pref_.save(&this->last_voc_save_time_)) {
+          ESP_LOGW(TAG, "Failed to save last VOC save time to preferences.");
+          // Continue anyway, state was saved, just timestamp persistence failed.
+        }
+      } else {
+        ESP_LOGW(TAG, "Failed to periodically save VOC algorithm state.");
+        // Update in-memory time even on failure to avoid hammering sensor/flash
+        // if there's a persistent issue, but don't save the failure time to preferences.
+        this->last_voc_save_time_ = millis();
+      }
+    }  // end if (!is_stabilizing)
+  }    // End periodic save logic
 }
 
 // ===================================
 // Implementation of protected helpers
 // ===================================
 
+/** @brief Writes VOC or NOx tuning parameters to the sensor. */
 bool SEN66Component::write_tuning_parameters_(uint16_t i2c_command, const GasTuning &tuning) {
   // Pack parameters according to Sensirion driver format (int16_t)
   uint16_t params[6];
@@ -476,25 +513,26 @@ bool SEN66Component::write_tuning_parameters_(uint16_t i2c_command, const GasTun
   return true;
 }
 
-// Update signature to include slot
-bool SEN66Component::write_temperature_compensation_(const TemperatureCompensation &compensation, uint16_t slot) {
-  if (slot > 4) {
-    ESP_LOGE(TAG, "Invalid temperature compensation slot: %d", slot);
+/** @brief Writes temperature compensation parameters to the specified slot on the sensor. */
+bool SEN66Component::write_temperature_compensation_(const TemperatureCompensation &compensation) {
+  if (compensation.slot > 4) {
+    ESP_LOGE(TAG, "Invalid temperature compensation slot: %d", compensation.slot);
     return false;
   }
-  uint16_t params[4];  // Now 4 words: offset, slope, time_constant, slot
+  uint16_t params[4];  // Cast to uint16_t to respect write_command() signature but sensor will use int16_t
   params[0] = (uint16_t) compensation.offset;
   params[1] = (uint16_t) compensation.normalized_offset_slope;
   params[2] = compensation.time_constant;
-  params[3] = slot;
+  params[3] = compensation.slot;
   if (!write_command(SEN66_SET_TEMPERATURE_OFFSET_PARAMETERS_CMD_ID, params, 4)) {
-    ESP_LOGE(TAG, "Set temperature compensation failed (slot %d). Err=%d", slot, this->last_error_);
+    ESP_LOGE(TAG, "Set temperature compensation failed (slot %d). Err=%d", compensation.slot, this->last_error_);
     return false;
   }
-  ESP_LOGD(TAG, "Successfully set temperature compensation for slot %d", slot);
+  ESP_LOGD(TAG, "Successfully set temperature compensation for slot %d", compensation.slot);
   return true;
 }
 
+/** @brief Writes temperature acceleration parameters to the sensor. */
 bool SEN66Component::write_temperature_acceleration_(const TemperatureAcceleration &params) {
   uint16_t packed_params[4];
   packed_params[0] = params.k;
@@ -509,25 +547,18 @@ bool SEN66Component::write_temperature_acceleration_(const TemperatureAccelerati
   return true;
 }
 
-bool SEN66Component::write_voc_algorithm_state_(const std::vector<uint8_t> &state) {
+/** @brief Writes the saved VOC algorithm state to the sensor. */
+bool SEN66Component::write_voc_algorithm_state_(const uint8_t state[8]) {
   if (this->current_state_ != IDLE) {
     ESP_LOGE(TAG, "Cannot write VOC state: Sensor must be in IDLE state (current: %d).", this->current_state_);
     return false;
   }
-  if (state.size() != 8) {
-    ESP_LOGE(TAG, "Invalid VOC state size (%zu bytes), expected 8.", state.size());
-    return false;
-  }
-
-  // Convert byte vector to uint16_t array (4 words)
-  uint16_t state_words[SEN66_VOC_ALGORITHM_STATE_SIZE];
-  memcpy(state_words, state.data(), 8);
 
   // Debug log the state being written
   ESP_LOGD(TAG, "Writing state: %02X %02X %02X %02X %02X %02X %02X %02X", state[0], state[1], state[2], state[3],
            state[4], state[5], state[6], state[7]);
 
-  if (!write_command(SEN66_SET_VOC_ALGORITHM_STATE_CMD_ID, state_words, SEN66_VOC_ALGORITHM_STATE_SIZE)) {
+  if (!write_command(SEN66_SET_VOC_ALGORITHM_STATE_CMD_ID, (uint16_t *) state, SEN66_VOC_ALGORITHM_STATE_SIZE)) {
     ESP_LOGE(TAG, "Set VOC algorithm state failed. Err=%d", this->last_error_);
     return false;
   }
@@ -535,37 +566,32 @@ bool SEN66Component::write_voc_algorithm_state_(const std::vector<uint8_t> &stat
   return true;
 }
 
+/** @brief Reads the VOC algorithm state from the sensor and saves it to ESPHome's preferences. */
 bool SEN66Component::save_voc_algorithm_state_() {
   if (!this->voc_sensor_) {
     ESP_LOGW(TAG, "Cannot save VOC state: VOC sensor not configured.");
     return false;
   }
 
-  std::vector<uint8_t> current_state;
+  uint8_t current_state[8];
   ESP_LOGV(TAG, "Reading current VOC state from sensor to save...");
   if (!this->read_voc_algorithm_state_(current_state)) {
     ESP_LOGW(TAG, "Failed to save VOC state: Could not retrieve current state from sensor.");
     return false;
   }
 
-  if (current_state.size() != 8) {
-    ESP_LOGW(TAG, "Failed to save VOC state: Unexpected state size read from sensor (%zu).", current_state.size());
-    return false;
-  }
-
-  uint8_t state_to_save[8];
-  memcpy(state_to_save, current_state.data(), 8);
-
   ESP_LOGV(TAG, "Saving VOC state to preferences...");
-  if (!this->pref_.save(&state_to_save)) {
+  if (!this->voc_state_pref_.save(&current_state)) {
     ESP_LOGW(TAG, "Failed to save VOC algorithm state to preferences (save operation failed).");
     return false;
   }
 
   ESP_LOGD(TAG, "Successfully saved VOC algorithm state to preferences.");
+  // Timestamp saving is handled in update() after this function returns true.
   return true;
 }
 
+/** @brief Writes the CO2 Automatic Self-Calibration status to the sensor. */
 bool SEN66Component::write_co2_asc_status_(bool enable) {
   uint16_t status = enable ? 0x0001 : 0x0000;
   if (!write_command(SEN66_SET_CO2_SENSOR_AUTOMATIC_SELF_CALIBRATION_CMD_ID, &status, 1)) {
@@ -576,6 +602,7 @@ bool SEN66Component::write_co2_asc_status_(bool enable) {
   return true;
 }
 
+/** @brief Writes the ambient pressure value to the sensor. */
 bool SEN66Component::write_ambient_pressure_(uint16_t pressure) {
   if (!write_command(SEN66_SET_AMBIENT_PRESSURE_CMD_ID, &pressure, 1)) {
     ESP_LOGE(TAG, "Set ambient pressure failed. Err=%d", this->last_error_);
@@ -585,6 +612,7 @@ bool SEN66Component::write_ambient_pressure_(uint16_t pressure) {
   return true;
 }
 
+/** @brief Writes the sensor altitude value to the sensor. */
 bool SEN66Component::write_sensor_altitude_(uint16_t altitude) {
   if (!write_command(SEN66_SET_SENSOR_ALTITUDE_CMD_ID, &altitude, 1)) {
     ESP_LOGE(TAG, "Set sensor altitude failed. Err=%d", this->last_error_);
@@ -594,7 +622,7 @@ bool SEN66Component::write_sensor_altitude_(uint16_t altitude) {
   return true;
 }
 
-// Read helpers are needed for the getter methods
+/** @brief Generic helper to read either VOC or NOx tuning parameters. */
 bool SEN66Component::read_tuning_parameters_(uint16_t i2c_command, GasTuning &tuning) {
   uint16_t params[6];
   if (!this->get_register((SEN66_CMD_ID) i2c_command, params, 6, 50)) {  // Use 50ms delay based on other reads
@@ -610,14 +638,13 @@ bool SEN66Component::read_tuning_parameters_(uint16_t i2c_command, GasTuning &tu
   return true;
 }
 
-bool SEN66Component::read_voc_algorithm_state_(std::vector<uint8_t> &state) {
-  uint16_t state_words[SEN66_VOC_ALGORITHM_STATE_SIZE];
-  if (!this->get_register(SEN66_GET_VOC_ALGORITHM_STATE_CMD_ID, state_words, SEN66_VOC_ALGORITHM_STATE_SIZE, 50)) {
+/** @brief Reads the VOC algorithm state from the sensor. */
+bool SEN66Component::read_voc_algorithm_state_(uint8_t state[8]) {
+  if (!this->get_register(SEN66_GET_VOC_ALGORITHM_STATE_CMD_ID, (uint16_t *) state, SEN66_VOC_ALGORITHM_STATE_SIZE,
+                          50)) {
     ESP_LOGW(TAG, "Failed to read VOC algorithm state from sensor.");
     return false;
   }
-  state.resize(8);
-  memcpy(state.data(), state_words, 8);
   ESP_LOGV(TAG, "Successfully read VOC algorithm state from sensor.");
   // Debug log the read state
   ESP_LOGD(TAG, "Read state: %02X %02X %02X %02X %02X %02X %02X %02X", state[0], state[1], state[2], state[3], state[4],
@@ -625,6 +652,7 @@ bool SEN66Component::read_voc_algorithm_state_(std::vector<uint8_t> &state) {
   return true;
 }
 
+/** @brief Loads the VOC algorithm state from ESPHome's preferences and writes it to the sensor. */
 bool SEN66Component::load_voc_algorithm_state_() {
   // Check if VOC sensor is configured
   if (!this->voc_sensor_) {
@@ -639,7 +667,7 @@ bool SEN66Component::load_voc_algorithm_state_() {
   }
 
   uint8_t state_to_load[8];
-  if (!this->pref_.load(&state_to_load)) {
+  if (!this->voc_state_pref_.load(&state_to_load)) {
     ESP_LOGD(TAG, "No saved VOC algorithm state found in preferences, doing nothing.");
     return false;
   }
@@ -647,11 +675,8 @@ bool SEN66Component::load_voc_algorithm_state_() {
   ESP_LOGD(TAG, "State bytes: %02X %02X %02X %02X %02X %02X %02X %02X", state_to_load[0], state_to_load[1],
            state_to_load[2], state_to_load[3], state_to_load[4], state_to_load[5], state_to_load[6], state_to_load[7]);
 
-  // Convert uint8_t[8] array to std::vector<uint8_t> for write function
-  std::vector<uint8_t> state_vec(state_to_load, state_to_load + 8);
-
   ESP_LOGD(TAG, "Attempting to write state to sensor...");
-  if (!this->write_voc_algorithm_state_(state_vec)) {  // Pass the vector
+  if (!this->write_voc_algorithm_state_(state_to_load)) {  // Pass the vector
     ESP_LOGW(TAG, "Failed to write VOC algorithm state to sensor.");
     return false;  // Write failed
   }
@@ -661,6 +686,7 @@ bool SEN66Component::load_voc_algorithm_state_() {
   return true;  // Write successful
 }
 
+/** @brief Reads the CO2 Automatic Self-Calibration status from the sensor. */
 bool SEN66Component::read_co2_asc_status_(bool &enabled) {
   uint16_t status_word;
   if (!this->get_register(SEN66_GET_CO2_SENSOR_AUTOMATIC_SELF_CALIBRATION_CMD_ID, &status_word, 1, 50)) {
@@ -672,6 +698,7 @@ bool SEN66Component::read_co2_asc_status_(bool &enabled) {
   return true;
 }
 
+/** @brief Reads the ambient pressure value from the sensor. */
 bool SEN66Component::read_ambient_pressure_(uint16_t &pressure) {
   if (!this->get_register(SEN66_GET_AMBIENT_PRESSURE_CMD_ID, &pressure, 1, 50)) {
     ESP_LOGW(TAG, "Failed to read ambient pressure.");
@@ -680,6 +707,7 @@ bool SEN66Component::read_ambient_pressure_(uint16_t &pressure) {
   return true;
 }
 
+/** @brief Reads the sensor altitude value from the sensor. */
 bool SEN66Component::read_sensor_altitude_(uint16_t &altitude) {
   if (!this->get_register(SEN66_GET_SENSOR_ALTITUDE_CMD_ID, &altitude, 1, 50)) {
     ESP_LOGW(TAG, "Failed to read sensor altitude.");
@@ -688,17 +716,19 @@ bool SEN66Component::read_sensor_altitude_(uint16_t &altitude) {
   return true;
 }
 
+/** @brief Reads humidity and temperature values after heater activation from the sensor. */
 bool SEN66Component::read_sht_heater_measurements_(float &humidity, float &temperature) {
   int16_t values[2];  // Returns two int16_t
   if (!this->get_register(SEN66_GET_SHT_HEATER_MEASUREMENTS_CMD_ID, (uint16_t *) values, 2, 50)) {
     ESP_LOGW(TAG, "Failed to read SHT heater measurements.");
     return false;
   }
-  humidity = sensirion_invalid_to_nan(values[0], (int16_t) 0x7FFF) / 100.0f;
-  temperature = sensirion_invalid_to_nan(values[1], (int16_t) 0x7FFF) / 200.0f;
+  humidity = sensirion_invalid_to_nan(values[0], (int16_t) 0x7FFF);
+  temperature = sensirion_invalid_to_nan(values[1], (int16_t) 0x7FFF);
   return true;
 }
 
+/** @brief Internal helper to read device status (with or without clearing). */
 bool SEN66Component::read_device_status_internal_(uint16_t command, sen66_device_status &status) {
   uint16_t status_words[2];  // Status is 32 bits = 2 words
   if (!this->get_register((SEN66_CMD_ID) command, status_words, 2, 50)) {
@@ -710,11 +740,13 @@ bool SEN66Component::read_device_status_internal_(uint16_t command, sen66_device
   return true;
 }
 
+/** @brief Set the maximum number of consecutive communication failures before triggering a device reboot. */
 void SEN66Component::set_max_consecutive_failures(uint8_t max_failures) {
   this->max_consecutive_failures_ = max_failures;
   ESP_LOGD(TAG, "Set max consecutive failures before reboot to: %d", max_failures);
 }
 
+/** @brief Get the currently configured VOC algorithm tuning parameters. Returns nullopt if not set. */
 optional<GasTuning> SEN66Component::get_voc_algorithm_tuning() {
   GasTuning tuning;
   if (!this->read_tuning_parameters_(SEN66_GET_VOC_ALGORITHM_TUNING_PARAMETERS_CMD_ID, tuning)) {
@@ -723,6 +755,7 @@ optional<GasTuning> SEN66Component::get_voc_algorithm_tuning() {
   return tuning;
 }
 
+/** @brief Get the currently configured NOx algorithm tuning parameters. Returns nullopt if not set. */
 optional<GasTuning> SEN66Component::get_nox_algorithm_tuning() {
   GasTuning tuning;
   if (!this->read_tuning_parameters_(SEN66_GET_NOX_ALGORITHM_TUNING_PARAMETERS_CMD_ID, tuning)) {
@@ -731,19 +764,26 @@ optional<GasTuning> SEN66Component::get_nox_algorithm_tuning() {
   return tuning;
 }
 
-void SEN66Component::set_temperature_acceleration_parameters(uint16_t k, uint16_t p, uint16_t t1, uint16_t t2) {
+/** @brief Set temperature acceleration parameters from YAML configuration. */
+void SEN66Component::set_temperature_acceleration_parameters(float k, float p, float t1, float t2) {
   TemperatureAcceleration params;
-  params.k = k;
-  params.p = p;
-  params.t1 = t1;
-  params.t2 = t2;
-  this->temperature_acceleration_ = params;
+  params.k = static_cast<uint16_t>(roundf(k * 10));
+  params.p = static_cast<uint16_t>(roundf(p * 10));
+  params.t1 = static_cast<uint16_t>(roundf(t1 * 10));
+  params.t2 = static_cast<uint16_t>(roundf(t2 * 10));
+  this->temp_accel_params_ = params;
   // Actual writing happens during setup() if called before, or needs separate trigger if called after.
   // For simplicity, we assume it's set in YAML and applied during setup.
   // If dynamic setting is needed, a separate action/service would be required.
   ESP_LOGD(TAG, "Temperature acceleration parameters queued for setup.");
 }
 
+/**
+ * @brief Perform a Forced Recalibration (FRC) for the CO2 sensor.
+ * Stops measurement, sends the FRC command, waits, reads the result, and restarts measurement.
+ * @param target_co2_concentration The target CO2 concentration in ppm.
+ * @return The correction factor applied by the sensor (scaled by 10000), or nullopt on failure.
+ */
 optional<uint16_t> SEN66Component::perform_forced_co2_recalibration(uint16_t target_co2_concentration) {
   ESP_LOGI(TAG, "Attempting CO2 Forced Recalibration (FRC) to %u ppm...", target_co2_concentration);
 
@@ -769,6 +809,11 @@ optional<uint16_t> SEN66Component::perform_forced_co2_recalibration(uint16_t tar
     ESP_LOGD(TAG, "Stopped measurement for FRC. Waiting 600ms before sending command...");
     this->set_timeout("frc_send_cmd", 600, [this]() {
       // --- Timeout Callback: Send FRC Command ---
+      if (!this->frc_target_concentration_.has_value()) {
+        ESP_LOGE(TAG, "FRC target concentration not set!");
+        this->handle_action_completion_(false);
+        return;
+      }
       ESP_LOGD(TAG, "Sending CO2 FRC command with target %u ppm...", this->frc_target_concentration_.value());
       if (!this->write_command(SEN66_PERFORM_FORCED_CO2_RECALIBRATION_CMD_ID, &this->frc_target_concentration_.value(),
                                1)) {
@@ -811,7 +856,12 @@ optional<uint16_t> SEN66Component::perform_forced_co2_recalibration(uint16_t tar
   // redesign (e.g., using a lambda callback provided by the caller).
 }
 
-// --- Timeout Callback: Read FRC Result ---
+/**
+ * @brief Reads the FRC result after the required sensor processing delay.
+ *
+ * Scheduled via `set_timeout` after sending the FRC command. Reads the correction factor,
+ * logs it, and then calls `handle_action_completion_` to restart measurements.
+ */
 void SEN66Component::handle_frc_read_result_() {
   uint16_t correction_raw;
   ESP_LOGD(TAG, "Reading CO2 FRC result...");
@@ -838,9 +888,16 @@ void SEN66Component::handle_frc_read_result_() {
   }
 }
 
-// Internal helper to stop measurement if needed.
-// Manages state transitions: MEASURING -> IDLE.
-// Stops the ESPHome poller if it was running.
+/**
+ * @brief Stops the sensor's measurement and the ESPHome poller if currently active.
+ *
+ * Called before initiating actions like cleaning, heating, FRC, or reset.
+ * Manages `current_state_`, `polling_active_before_action_`, `original_interval_before_action_`,
+ * and sends the `SEN66_STOP_MEASUREMENT_CMD_ID`.
+ *
+ * @return true if measurement was stopped successfully or was already stopped.
+ * @return false if the stop command failed.
+ */
 bool SEN66Component::stop_measurement_if_needed_() {
   if (!this->initialized_) {
     ESP_LOGW(TAG, "Stop measurement requested but component not initialized.");
@@ -885,9 +942,16 @@ bool SEN66Component::stop_measurement_if_needed_() {
   return true;  // Indicate success.
 }
 
-// Internal helper to handle completion of asynchronous actions.
-// Manages state transitions back to MEASURING or IDLE.
-// Restarts the ESPHome poller if it was previously active.
+/**
+ * @brief Restarts measurements and polling after an action completes.
+ *
+ * Scheduled via `set_timeout` after the action's duration (or FRC result read).
+ * Checks `polling_active_before_action_` to determine if polling should resume.
+ * Sends `SEN66_START_CONTINUOUS_MEASUREMENT_CMD_ID`, restores polling interval,
+ * sets `next_update_allowed_time_` for stabilization, and sets `current_state_` to `MEASURING` or `IDLE`.
+ *
+ * @param command_success Flag indicating if the preceding action command was successful.
+ */
 void SEN66Component::handle_action_completion_(bool action_step_success) {
   auto previous_state = this->current_state_;  // For logging.
   ESP_LOGD(TAG, "Handling action completion (previous state: %d, success flag: %d)...", previous_state,
@@ -927,6 +991,12 @@ void SEN66Component::handle_action_completion_(bool action_step_success) {
   }
 }
 
+/**
+ * @brief Activate the SHT sensor's internal heater.
+ * Stops measurement, activates heater, waits (~20s), deactivates (implicitly), and restarts measurement.
+ * Useful in high humidity to prevent condensation.
+ * @return True if the heater activation command was sent successfully, false otherwise.
+ */
 bool SEN66Component::activate_sht_heater() {
   // --- State Check: Ensure component is not already busy ---
   if (this->current_state_ != MEASURING && this->current_state_ != IDLE) {
@@ -961,6 +1031,11 @@ bool SEN66Component::activate_sht_heater() {
   return true;  // Activation initiated successfully, will complete asynchronously.
 }
 
+/**
+ * @brief Get the measurements taken during the SHT heater activation cycle.
+ * Should be called *after* activate_sht_heater completes.
+ * @return A pair containing <humidity, temperature> measured during heating, or nullopt on error.
+ */
 optional<std::pair<float, float>> SEN66Component::get_sht_heater_measurements() {
   // Requires idle mode & FW >= 4.0
   // Note: This function itself doesn't stop measurement, assumes user has ensured idle state
@@ -975,7 +1050,7 @@ optional<std::pair<float, float>> SEN66Component::get_sht_heater_measurements() 
     return {};
   }
 
-  uint8_t fw_major = this->firmware_version_ >> 8;
+  uint8_t fw_major = this->version_info_.firmware_major;
   if (fw_major < 4) {
     ESP_LOGE(TAG, "SHT heater measurements only available for firmware >= 4.0 (Current: %d.x)", fw_major);
     return {};
@@ -996,6 +1071,7 @@ optional<std::pair<float, float>> SEN66Component::get_sht_heater_measurements() 
   return std::make_pair(humidity, temperature);
 }
 
+/** @brief Read the current device status register. */
 optional<sen66_device_status> SEN66Component::read_device_status() {
   sen66_device_status status;
   if (!this->read_device_status_internal_(SEN66_READ_DEVICE_STATUS_CMD_ID, status)) {
@@ -1004,6 +1080,7 @@ optional<sen66_device_status> SEN66Component::read_device_status() {
   return status;
 }
 
+/** @brief Read the device status register and clear any latched status flags. */
 optional<sen66_device_status> SEN66Component::read_and_clear_device_status() {
   sen66_device_status status;
   if (!this->read_device_status_internal_(SEN66_READ_AND_CLEAR_DEVICE_STATUS_CMD_ID, status)) {
@@ -1013,6 +1090,7 @@ optional<sen66_device_status> SEN66Component::read_and_clear_device_status() {
   return status;
 }
 
+/** @brief Start the fan cleaning cycle. */
 bool SEN66Component::start_fan_cleaning() {
   // --- State Check: Ensure component is not already busy ---
   if (this->current_state_ != MEASURING && this->current_state_ != IDLE) {
@@ -1048,6 +1126,7 @@ bool SEN66Component::start_fan_cleaning() {
   return true;  // Cleaning initiated successfully, will complete asynchronously.
 }
 
+/** @brief Set temperature compensation parameters from YAML configuration for a specific slot. */
 void SEN66Component::set_temperature_compensation(float offset, float normalized_offset_slope, uint16_t time_constant,
                                                   uint16_t slot) {
   if (slot > 4) {
@@ -1055,17 +1134,18 @@ void SEN66Component::set_temperature_compensation(float offset, float normalized
     return;
   }
   TemperatureCompensation temp_comp;
-  temp_comp.offset = offset * 200;
-  temp_comp.normalized_offset_slope = normalized_offset_slope * 10000;
+  temp_comp.offset = static_cast<int16_t>(roundf(offset * 200));
+  temp_comp.normalized_offset_slope = static_cast<int16_t>(roundf(normalized_offset_slope * 10000));
   temp_comp.time_constant = time_constant;
-  temperature_compensation_slot_ = slot;  // Store the slot
-  temperature_compensation_ = temp_comp;
+  temp_comp.slot = slot;                // Store the slot
+  this->temp_comp_params_ = temp_comp;  // Store the parameters
   // Queued for setup
   ESP_LOGD(TAG, "Temperature compensation for slot %d queued for setup.", slot);
 }
 
 // --- Configuration Setters/Getters ---
 
+/** @brief Enable or disable CO2 Automatic Self-Calibration (ASC). */
 void SEN66Component::set_co2_automatic_self_calibration(bool enable) {
   this->co2_asc_enabled_ = enable;
   // Configuration is applied during setup(). If called dynamically while running,
@@ -1073,6 +1153,7 @@ void SEN66Component::set_co2_automatic_self_calibration(bool enable) {
   ESP_LOGD(TAG, "CO2 ASC status (%s) queued - will be applied during next setup/restart.", ONOFF(enable));
 }
 
+/** @brief Get the current status of CO2 Automatic Self-Calibration (ASC). Returns nullopt on error. */
 optional<bool> SEN66Component::get_co2_automatic_self_calibration() {
   bool enabled;
   // This command works in MEASURING or IDLE state according to Sensirion C driver.
@@ -1082,6 +1163,7 @@ optional<bool> SEN66Component::get_co2_automatic_self_calibration() {
   return enabled;
 }
 
+/** @brief Set the ambient pressure for CO2 compensation. */
 void SEN66Component::set_ambient_pressure(uint16_t ambient_pressure) {
   if (ambient_pressure < 700 || ambient_pressure > 1200) {
     ESP_LOGW(TAG, "Ambient pressure %u hPa outside valid range (700-1200), ignoring.", ambient_pressure);
@@ -1105,6 +1187,7 @@ void SEN66Component::set_ambient_pressure(uint16_t ambient_pressure) {
   }
 }
 
+/** @brief Get the currently set ambient pressure. Returns nullopt on error. */
 optional<uint16_t> SEN66Component::get_ambient_pressure() {
   uint16_t pressure;
   // This command works in MEASURING or IDLE state according to Sensirion C driver.
@@ -1114,6 +1197,7 @@ optional<uint16_t> SEN66Component::get_ambient_pressure() {
   return pressure;
 }
 
+/** @brief Set the sensor altitude for CO2 compensation. */
 void SEN66Component::set_sensor_altitude(uint16_t altitude) {
   if (altitude > 3000) {  // Valid range 0-3000m according to SCD4x datasheet (likely similar)
     ESP_LOGW(TAG, "Sensor altitude %u m outside typical valid range (0-3000), ignoring.", altitude);
@@ -1125,6 +1209,7 @@ void SEN66Component::set_sensor_altitude(uint16_t altitude) {
   ESP_LOGD(TAG, "Sensor altitude (%u m) queued - will be applied during next setup/restart.", altitude);
 }
 
+/** @brief Get the currently set sensor altitude. Returns nullopt on error. */
 optional<uint16_t> SEN66Component::get_sensor_altitude() {
   uint16_t altitude;
   // This command requires IDLE state according to Sensirion C driver.
@@ -1139,7 +1224,13 @@ optional<uint16_t> SEN66Component::get_sensor_altitude() {
   return altitude;
 }
 
-// Implementation for factory_reset action
+/**
+ * @brief Perform a factory reset on the sensor.
+ * Stops measurement, clears the component's persistent data (VOC state and last save timestamp)
+ * from NVS using `global_preferences->reset()`, sends the hardware reset command to the sensor,
+ * and then triggers a safe reboot of the ESPHome device to ensure re-initialization.
+ * **Warning:** This clears the learned VOC algorithm state.
+ */
 void SEN66Component::factory_reset() {
   ESP_LOGI(TAG, "Attempting factory reset...");
 
@@ -1150,14 +1241,22 @@ void SEN66Component::factory_reset() {
   }
 
   if (this->voc_sensor_) {
-    ESP_LOGD(TAG, "Clearing saved VOC algorithm state from preferences due to factory reset...");
+    ESP_LOGD(TAG, "Clearing all component preferences (VOC state and timestamp) via global reset...");
+    // Use global reset which targets all preferences associated with this component's hash.
+    // This covers both voc_state_pref_ and last_voc_save_time_pref_.
     if (!global_preferences->reset()) {
-      ESP_LOGW(TAG, "Failed to clear VOC algorithm state from preferences during factory reset.");
+      ESP_LOGW(TAG, "Failed to clear component preferences during factory reset.");
+      // Continue reset process, but old preferences might remain.
     }
-    this->pref_ = nullptr;
+    // Nullify preference object handles after reset
+    this->voc_state_pref_ = nullptr;
+    this->last_voc_save_time_pref_ = nullptr;
   }
 
-  ESP_LOGI(TAG, "Factory reset command sent successfully. Rebooting component...");
+  // Resetting the hardware sensor is not done here, as the primary purpose is
+  // clearing the ESPHome-side state and re-initializing the component.
+  // A reboot handles the re-initialization.
+  ESP_LOGI(TAG, "Component preferences cleared. Rebooting component to re-initialize...");
   App.safe_reboot();
 }
 

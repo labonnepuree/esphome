@@ -5,6 +5,9 @@
 #include "sen66.h"
 
 namespace esphome {
+/**
+ * @brief Namespace for the SEN66 sensor component.
+ */
 namespace sen66 {
 
 /**
