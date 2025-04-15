@@ -1157,8 +1157,8 @@ void SEN66Component::factory_reset() {
     this->pref_ = nullptr;
   }
 
-  ESP_LOGI(TAG, "Factory reset command sent successfully. Waiting for component to restart...");
-  this->mark_failed();
+  ESP_LOGI(TAG, "Factory reset command sent successfully. Rebooting component...");
+  App.safe_reboot();
 }
 
 }  // namespace sen66
