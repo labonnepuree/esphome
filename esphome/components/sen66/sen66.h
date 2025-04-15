@@ -163,8 +163,6 @@ class SEN66Component : public PollingComponent, public sensirion_common::Sensiri
   // Add Temperature Acceleration parameters
   void set_temperature_acceleration_parameters(uint16_t k, uint16_t p, uint16_t t1, uint16_t t2);
   // Add VOC algorithm state methods
-  bool set_voc_algorithm_state(const std::vector<uint8_t> &state);
-  optional<std::vector<uint8_t>> get_voc_algorithm_state();
   // Add CO2 related methods
   optional<uint16_t> perform_forced_co2_recalibration(uint16_t target_co2_concentration);
   void set_co2_automatic_self_calibration(bool enable);
@@ -186,7 +184,15 @@ class SEN66Component : public PollingComponent, public sensirion_common::Sensiri
   // Setter for max consecutive failures
   void set_max_consecutive_failures(uint8_t max_failures);
 
+  // Actions
+  void factory_reset();
+
  protected:
+  // Continue setup after reset callback
+  void continue_setup_after_reset_();
+  // Continue setup after stop callback
+  void continue_setup_after_stop_();
+
   bool write_tuning_parameters_(uint16_t i2c_command, const GasTuning &tuning);
   // Update to include slot
   bool write_temperature_compensation_(const TemperatureCompensation &compensation, uint16_t slot);
@@ -250,6 +256,10 @@ class SEN66Component : public PollingComponent, public sensirion_common::Sensiri
    */
   void handle_frc_read_result_();  // New handler specifically for FRC result reading
 
+  // --- Internal VOC Algorithm State Helpers ---
+  bool save_voc_algorithm_state_();
+  bool load_voc_algorithm_state_();
+
   bool initialized_{false};
   ComponentState current_state_{IDLE};             // Tracks the current operational state of the component.
   uint32_t original_interval_before_action_{0};    // Stores the polling interval before an action stops it.
@@ -286,8 +296,7 @@ class SEN66Component : public PollingComponent, public sensirion_common::Sensiri
   optional<bool> co2_asc_enabled_;
   optional<uint16_t> ambient_pressure_hpa_;
   optional<uint16_t> sensor_altitude_m_;
-  std::vector<uint8_t> voc_algorithm_state_to_restore_;  // Buffer to hold state before measurement starts
-  ESPPreferenceObject pref_;                             // Change back to ESPPreferenceObject for raw data
+  ESPPreferenceObject pref_;  // Will be used to store voc_algorithm_state if needed
 
   // Member variables for error counting
   uint8_t consecutive_update_failures_{0};

@@ -22,7 +22,6 @@ template<typename T> float sensirion_invalid_to_nan(T value, T invalid_value) {
 void SEN66Component::setup() {
   ESP_LOGCONFIG(TAG, "Setting up SEN66...");
   // --- Initial State Setup ---
-  this->current_state_ = IDLE;                 // Start in IDLE state before initialization.
   this->original_interval_before_action_ = 0;  // Reset stored interval, not relevant here yet.
   this->next_update_allowed_time_ = 0;         // Reset stabilization timer.
 
@@ -34,11 +33,13 @@ void SEN66Component::setup() {
     return;
   }
 
-  // Wait for reset to complete (official example uses 1.2 seconds)
-  delay(1200);
+  // Wait for reset to complete (execution time of reset command is 1.2 seconds, adding 100ms for safety)
+  this->set_timeout("setup_reset", 1300, [this]() { this->continue_setup_after_reset_(); });
+}
 
-  // Continue with setup logic directly (no more initial set_timeout)
-
+void SEN66Component::continue_setup_after_reset_() {
+  ESP_LOGD(TAG, "Continuing setup after reset...");
+  // Check if measurement is running
   uint16_t data_ready_word;
   // Check if measurement is running by checking data ready flag (will be 0 if idle)
   if (!this->get_register(SEN66_GET_DATA_READY_CMD_ID, &data_ready_word, 1, 50)) {
@@ -52,16 +53,25 @@ void SEN66Component::setup() {
   if (is_measuring) {
     ESP_LOGD(TAG, "Sensor is measuring, stopping...");
     if (!this->write_command(SEN66_STOP_MEASUREMENT_CMD_ID)) {
-      ESP_LOGE(TAG, "Failed to stop measurements during setup.");
+      ESP_LOGE(TAG, "Failed to stop measurements during setup. Cannot proceed reliably.");
       this->mark_failed();
-      return;
+      return;  // Abort setup
     }
-    // Wait state transition time (Datasheet doesn't specify for stop->config, using common 50ms)
-    // Old code used 200ms. Official examples use ~20-50ms.
-    delay(50);
+    // Schedule the rest of setup after the required 1000ms delay
+    ESP_LOGD(TAG, "Scheduling rest of setup after 1000ms stop delay...");
+    // 1000ms delay is the minimum delay required by the datasheet, adding 100ms for safety
+    this->set_timeout("setup_stop", 1100, [this]() { this->continue_setup_after_stop_(); });
+    // Setup will continue in the callback
   } else {
-    ESP_LOGD(TAG, "Sensor is idle.");
+    ESP_LOGD(TAG, "Sensor is idle, proceeding with setup directly.");
+    this->continue_setup_after_stop_();
   }
+}
+
+void SEN66Component::continue_setup_after_stop_() {
+  ESP_LOGD(TAG, "Continuing setup after stop...");
+  // Ensure state is IDLE
+  this->current_state_ = IDLE;
 
   // --- Read Static Information ---
   uint8_t serial_bytes[8];  // Read 8 bytes = 4 words for serial
@@ -138,37 +148,21 @@ void SEN66Component::setup() {
     delay(20);
   }
 
-  // Load VOC state from preferences if available, prepare it for writing
+  // Initialize preference object
   if (this->voc_sensor_) {  // Only relevant if VOC sensor is configured
     uint32_t combined_serial = encode_uint32(this->serial_number_[0], this->serial_number_[1], this->serial_number_[2],
                                              this->serial_number_[3]);
-    uint32_t hash = fnv1_hash(App.get_compilation_time() + "_sen66_" + std::to_string(combined_serial));
+    uint32_t hash = fnv1_hash("sen66_" + std::to_string(combined_serial));
     this->pref_ = global_preferences->make_preference<uint8_t[8]>(hash);
-    uint8_t loaded_state[8];
-    if (this->pref_.load(&loaded_state)) {
-      // Directly load into the restore buffer if successful
-      ESP_LOGI(TAG, "Loaded saved VOC algorithm state.");
-      this->voc_algorithm_state_to_restore_.assign(loaded_state, loaded_state + 8);
-      // Debug log the loaded state
-      ESP_LOGD(TAG, "Loaded state: %02X %02X %02X %02X %02X %02X %02X %02X", loaded_state[0], loaded_state[1],
-               loaded_state[2], loaded_state[3], loaded_state[4], loaded_state[5], loaded_state[6], loaded_state[7]);
-    } else {
-      ESP_LOGD(TAG, "No saved VOC algorithm state found.");
-    }
-  }
 
-  // Write VOC state BEFORE starting measurement if it was loaded
-  if (!this->voc_algorithm_state_to_restore_.empty()) {
-    ESP_LOGD(TAG, "Restoring VOC algorithm state...");
-    if (!this->write_voc_algorithm_state_(this->voc_algorithm_state_to_restore_)) {
-      ESP_LOGW(TAG, "Failed to restore VOC algorithm state.");
-      // Continue anyway, sensor will start with default state
+    // Load VOC state from preferences and write to sensor
+    ESP_LOGD(TAG, "Attempting to load VOC algorithm state from preferences...");
+    if (!this->load_voc_algorithm_state_()) {
+      ESP_LOGW(TAG, "Failed to load and apply VOC algorithm state from preferences (or none found).");
+      // Continue anyway, sensor will start with default state or its current state.
     } else {
-      ESP_LOGI(TAG, "Successfully restored VOC algorithm state.");
+      ESP_LOGI(TAG, "Successfully loaded and applied VOC state from preferences.");
     }
-    // Clear the buffer after attempting write
-    this->voc_algorithm_state_to_restore_.clear();
-    delay(20);
   }
 
   if (this->co2_asc_enabled_.has_value()) {
@@ -204,9 +198,9 @@ void SEN66Component::setup() {
   // --- State Transition: IDLE -> MEASURING ---
   this->current_state_ = MEASURING;  // Successfully started measuring.
   // Set initial stabilization delay: update() will wait before first read.
-  this->next_update_allowed_time_ =
-      std::max(millis() + 1200, this->next_update_allowed_time_);  // ~1.1s needed for first data.
-  ESP_LOGD(TAG, "Measurement started. Next read allowed after 1200 ms.");
+  // ~1.1s needed for first data + 10s for stabilization
+  this->next_update_allowed_time_ = std::max(millis() + 12000, this->next_update_allowed_time_);
+  ESP_LOGD(TAG, "Measurement started. Next read allowed after 12000 ms.");
 
   // Measurement start command needs ~1.1s until first data is ready.
   // Update interval should be longer than this.
@@ -444,42 +438,19 @@ void SEN66Component::update() {
     }
   }
 
-  // This logic replaces the old baseline saving
-  // Trigger e.g., every hour? This needs careful consideration regarding flash wear.
-  // Example: save every 3600 seconds (1 hour)
+  // Trigger VOC state saving periodically.
   static uint32_t last_voc_save_time = 0;         // Use static to preserve value across calls
   const uint32_t voc_save_interval_ms = 3600000;  // 1 hour
 
   if (this->voc_sensor_ && (millis() - last_voc_save_time > voc_save_interval_ms || last_voc_save_time == 0)) {
     // Pref object is only created if voc_sensor_ exists, so this check is sufficient.
     ESP_LOGD(TAG, "Attempting periodic VOC algorithm state save (Interval: %u ms)...", voc_save_interval_ms);
-    auto current_state_opt = this->get_voc_algorithm_state();
-    if (current_state_opt.has_value()) {
-      // Convert std::vector to uint8_t array for saving
-      if (current_state_opt.value().size() == 8) {
-        uint8_t state_to_save[8];
-        memcpy(state_to_save, current_state_opt.value().data(), 8);
-
-        // Debug log the state being saved
-        ESP_LOGD(TAG, "State to save: %02X %02X %02X %02X %02X %02X %02X %02X", state_to_save[0], state_to_save[1],
-                 state_to_save[2], state_to_save[3], state_to_save[4], state_to_save[5], state_to_save[6],
-                 state_to_save[7]);
-
-        if (this->pref_.save(&state_to_save)) {
-          ESP_LOGI(TAG, "Periodically saved VOC algorithm state.");
-          last_voc_save_time = millis();  // Update last save time only on success
-        } else {
-          ESP_LOGW(TAG, "Failed to periodically save VOC algorithm state (save operation failed).");
-          // Optionally clear last_voc_save_time to retry sooner? Or keep it to avoid hammering flash? Keeping it for
-          // now.
-        }
-      } else {
-        ESP_LOGW(TAG, "Failed to save VOC state: Unexpected state size (%zu).", current_state_opt.value().size());
-      }
+    if (this->save_voc_algorithm_state_()) {
+      ESP_LOGI(TAG, "Periodically saved VOC algorithm state.");
+      last_voc_save_time = millis();  // Update last save time only on success
     } else {
-      ESP_LOGW(TAG, "Failed to save VOC state: Could not retrieve current state from sensor.");
-      // Consider if we should update last_voc_save_time here to prevent retrying immediately.
-      // Let's update it to avoid constant failed read attempts if the sensor is unresponsive.
+      ESP_LOGW(TAG, "Failed to periodically save VOC algorithm state.");
+      // Update time even on failure to avoid hammering sensor/flash if there's a persistent issue
       last_voc_save_time = millis();
     }
   }  // End periodic save logic
@@ -539,21 +510,59 @@ bool SEN66Component::write_temperature_acceleration_(const TemperatureAccelerati
 }
 
 bool SEN66Component::write_voc_algorithm_state_(const std::vector<uint8_t> &state) {
+  if (this->current_state_ != IDLE) {
+    ESP_LOGE(TAG, "Cannot write VOC state: Sensor must be in IDLE state (current: %d).", this->current_state_);
+    return false;
+  }
   if (state.size() != 8) {
     ESP_LOGE(TAG, "Invalid VOC state size (%zu bytes), expected 8.", state.size());
     return false;
   }
+
   // Convert byte vector to uint16_t array (4 words)
   uint16_t state_words[SEN66_VOC_ALGORITHM_STATE_SIZE];
   memcpy(state_words, state.data(), 8);
 
-  // Need to potentially byte swap if SensirionI2CDevice handles it automatically
-  // Assuming write_command expects host byte order and handles swapping if needed
+  // Debug log the state being written
+  ESP_LOGD(TAG, "Writing state: %02X %02X %02X %02X %02X %02X %02X %02X", state[0], state[1], state[2], state[3],
+           state[4], state[5], state[6], state[7]);
+
   if (!write_command(SEN66_SET_VOC_ALGORITHM_STATE_CMD_ID, state_words, SEN66_VOC_ALGORITHM_STATE_SIZE)) {
     ESP_LOGE(TAG, "Set VOC algorithm state failed. Err=%d", this->last_error_);
     return false;
   }
-  ESP_LOGD(TAG, "Successfully wrote VOC algorithm state.");
+  ESP_LOGD(TAG, "Successfully wrote VOC algorithm state to sensor.");
+  return true;
+}
+
+bool SEN66Component::save_voc_algorithm_state_() {
+  if (!this->voc_sensor_) {
+    ESP_LOGW(TAG, "Cannot save VOC state: VOC sensor not configured.");
+    return false;
+  }
+
+  std::vector<uint8_t> current_state;
+  ESP_LOGV(TAG, "Reading current VOC state from sensor to save...");
+  if (!this->read_voc_algorithm_state_(current_state)) {
+    ESP_LOGW(TAG, "Failed to save VOC state: Could not retrieve current state from sensor.");
+    return false;
+  }
+
+  if (current_state.size() != 8) {
+    ESP_LOGW(TAG, "Failed to save VOC state: Unexpected state size read from sensor (%zu).", current_state.size());
+    return false;
+  }
+
+  uint8_t state_to_save[8];
+  memcpy(state_to_save, current_state.data(), 8);
+
+  ESP_LOGV(TAG, "Saving VOC state to preferences...");
+  if (!this->pref_.save(&state_to_save)) {
+    ESP_LOGW(TAG, "Failed to save VOC algorithm state to preferences (save operation failed).");
+    return false;
+  }
+
+  ESP_LOGD(TAG, "Successfully saved VOC algorithm state to preferences.");
   return true;
 }
 
@@ -604,13 +613,52 @@ bool SEN66Component::read_tuning_parameters_(uint16_t i2c_command, GasTuning &tu
 bool SEN66Component::read_voc_algorithm_state_(std::vector<uint8_t> &state) {
   uint16_t state_words[SEN66_VOC_ALGORITHM_STATE_SIZE];
   if (!this->get_register(SEN66_GET_VOC_ALGORITHM_STATE_CMD_ID, state_words, SEN66_VOC_ALGORITHM_STATE_SIZE, 50)) {
-    ESP_LOGW(TAG, "Failed to read VOC algorithm state.");
+    ESP_LOGW(TAG, "Failed to read VOC algorithm state from sensor.");
     return false;
   }
   state.resize(8);
   memcpy(state.data(), state_words, 8);
-  // Handle potential byte swapping if needed (depends on get_register implementation)
+  ESP_LOGV(TAG, "Successfully read VOC algorithm state from sensor.");
+  // Debug log the read state
+  ESP_LOGD(TAG, "Read state: %02X %02X %02X %02X %02X %02X %02X %02X", state[0], state[1], state[2], state[3], state[4],
+           state[5], state[6], state[7]);
   return true;
+}
+
+bool SEN66Component::load_voc_algorithm_state_() {
+  // Check if VOC sensor is configured
+  if (!this->voc_sensor_) {
+    ESP_LOGD(TAG, "Cannot load VOC state: VOC sensor not configured.");
+    return false;  // Not an error, just nothing to load.
+  }
+
+  // Ensure sensor is IDLE
+  if (this->current_state_ != IDLE) {  // Corrected check
+    ESP_LOGE(TAG, "Cannot load VOC state: Sensor must be in IDLE state (current: %d).", this->current_state_);
+    return false;
+  }
+
+  uint8_t state_to_load[8];
+  if (!this->pref_.load(&state_to_load)) {
+    ESP_LOGD(TAG, "No saved VOC algorithm state found in preferences, doing nothing.");
+    return false;
+  }
+  ESP_LOGI(TAG, "Loaded saved VOC algorithm state from preferences.");
+  ESP_LOGD(TAG, "State bytes: %02X %02X %02X %02X %02X %02X %02X %02X", state_to_load[0], state_to_load[1],
+           state_to_load[2], state_to_load[3], state_to_load[4], state_to_load[5], state_to_load[6], state_to_load[7]);
+
+  // Convert uint8_t[8] array to std::vector<uint8_t> for write function
+  std::vector<uint8_t> state_vec(state_to_load, state_to_load + 8);
+
+  ESP_LOGD(TAG, "Attempting to write state to sensor...");
+  if (!this->write_voc_algorithm_state_(state_vec)) {  // Pass the vector
+    ESP_LOGW(TAG, "Failed to write VOC algorithm state to sensor.");
+    return false;  // Write failed
+  }
+
+  ESP_LOGD(TAG, "Successfully wrote VOC algorithm state to sensor.");
+  delay(20);    // Short delay after successful write
+  return true;  // Write successful
 }
 
 bool SEN66Component::read_co2_asc_status_(bool &enabled) {
@@ -694,29 +742,6 @@ void SEN66Component::set_temperature_acceleration_parameters(uint16_t k, uint16_
   // For simplicity, we assume it's set in YAML and applied during setup.
   // If dynamic setting is needed, a separate action/service would be required.
   ESP_LOGD(TAG, "Temperature acceleration parameters queued for setup.");
-}
-
-bool SEN66Component::set_voc_algorithm_state(const std::vector<uint8_t> &state) {
-  // This function is intended to be called dynamically (e.g., from a service call)
-  // It needs to handle stopping measurement, writing state, restarting measurement.
-  // This is complex and might be better handled via a dedicated ESPHome "action".
-  // For now, provide a basic implementation that queues the state for the *next* setup.
-  if (state.size() != 8) {
-    ESP_LOGE(TAG, "Invalid VOC state size provided (%zu bytes), expected 8.", state.size());
-    return false;
-  }
-  ESP_LOGI(TAG, "Queuing VOC algorithm state to be restored on next setup/restart.");
-  this->voc_algorithm_state_to_restore_ = state;
-  // Note: This doesn't apply the state immediately. Sensor needs restart or setup rerun.
-  return true;  // Return true indicating state was queued
-}
-
-optional<std::vector<uint8_t>> SEN66Component::get_voc_algorithm_state() {
-  std::vector<uint8_t> state;
-  if (!this->read_voc_algorithm_state_(state)) {
-    return {};  // Return empty optional on failure
-  }
-  return state;
 }
 
 optional<uint16_t> SEN66Component::perform_forced_co2_recalibration(uint16_t target_co2_concentration) {
@@ -1112,6 +1137,45 @@ optional<uint16_t> SEN66Component::get_sensor_altitude() {
     return {};
   }
   return altitude;
+}
+
+// Implementation for factory_reset action
+void SEN66Component::factory_reset() {
+  ESP_LOGI(TAG, "Attempting factory reset...");
+
+  // Ensure measurement is stopped before sending the reset command
+  if (!this->stop_measurement_if_needed_()) {
+    ESP_LOGE(TAG, "Failed to stop measurement before factory reset. Aborting.");
+    return;
+  }
+
+  if (this->voc_sensor_) {
+    ESP_LOGD(TAG, "Clearing saved VOC algorithm state from preferences due to factory reset...");
+    uint8_t default_state[8] = {0};
+    if (!this->pref_.save(&default_state)) {
+      ESP_LOGW(TAG, "Failed to clear VOC algorithm state from preferences during factory reset.");
+      // Continue with reset process regardless
+    } else {
+      ESP_LOGD(TAG, "Cleared VOC algorithm state from preferences.");
+    }
+  }
+
+  ESP_LOGD(TAG, "Sending device reset command...");
+  if (!this->write_command(SEN66_DEVICE_RESET_CMD_ID)) {
+    ESP_LOGE(TAG, "Failed to send factory reset command.");
+    // Try to restart measurement anyway, as the state might be recoverable
+    this->handle_action_completion_(false);  // Indicate the reset command itself failed
+    return;
+  }
+
+  ESP_LOGI(TAG, "Factory reset command sent successfully. Sensor will reboot.");
+  // Wait for the sensor to reboot before attempting to restart measurements
+  this->set_timeout("factory_reset_wait", 2500, [this]() {
+    ESP_LOGD(TAG, "Post-factory reset: Handling action completion.");
+    // On next boot, setup() will try to load state from prefs (which are now cleared/default)
+    // and write that default state to the sensor if needed.
+    this->handle_action_completion_(true);  // Indicate reset command succeeded
+  });
 }
 
 }  // namespace sen66

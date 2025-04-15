@@ -34,16 +34,19 @@ from esphome.const import (
     UNIT_PERCENT,
 )
 
+# Component metadata
 CODEOWNERS = ["@labonnepuree"]
 DEPENDENCIES = ["i2c"]
 AUTO_LOAD = ["sensirion_common"]
 
+# Define the namespace and component class
 sen66_ns = cg.esphome_ns.namespace("sen66")
 SEN66Component = sen66_ns.class_(
     "SEN66Component", cg.PollingComponent, sensirion_common.SensirionI2CDevice
 )
 
 # --- Configuration Keys ---
+# General configuration keys
 CONF_AMBIENT_PRESSURE_HPA = "ambient_pressure"
 CONF_SENSOR_ALTITUDE_M = "sensor_altitude"
 CONF_ALGORITHM_TUNING = (
@@ -78,11 +81,13 @@ CONF_NC_4_0 = "number_concentration_4_0"
 CONF_NC_10_0 = "number_concentration_10_0"
 
 # --- Actions & Services ---
+# Define automation action classes
 StartFanAction = sen66_ns.class_("StartFanAction", automation.Action)
 ActivateShtHeaterAction = sen66_ns.class_("ActivateShtHeaterAction", automation.Action)
 PerformForcedCo2RecalibrationAction = sen66_ns.class_(
     "PerformForcedCo2RecalibrationAction", automation.Action
 )
+FactoryResetAction = sen66_ns.class_("FactoryResetAction", automation.Action)
 
 # --- Schemas ---
 
@@ -252,6 +257,8 @@ SENSOR_SETTERS = {
 
 
 async def to_code(config):
+    """Generate C++ code from the configuration."""
+    # Create the component variable
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await i2c.register_i2c_device(var, config)
@@ -260,14 +267,17 @@ async def to_code(config):
     for key, func_name in SENSOR_SETTERS.items():
         if key in config:
             sensor_config = config[key]
+            # Create a new sensor object from the configuration
             sens = await sensor.new_sensor(
                 sensor_config
             )  # Pass the whole sensor block config
+            # Set the sensor in the component
             cg.add(getattr(var, func_name)(sens))
 
             # Handle nested algorithm tuning for VOC
             if key == CONF_VOC and CONF_ALGORITHM_TUNING in sensor_config:
                 cfg = sensor_config[CONF_ALGORITHM_TUNING]
+                # Configure VOC algorithm parameters with defaults if not specified
                 cg.add(
                     var.set_voc_algorithm_tuning(
                         cfg.get(CONF_INDEX_OFFSET, 100),
@@ -281,24 +291,20 @@ async def to_code(config):
             # Handle nested algorithm tuning for NOx
             elif key == CONF_NOX and CONF_ALGORITHM_TUNING in sensor_config:
                 cfg = sensor_config[CONF_ALGORITHM_TUNING]
-                gating = cfg.get(CONF_GATING_MAX_DURATION_MINUTES, 720)
-                if gating == 180:  # Check if still default VOC value
-                    print(
-                        f"Note: Overriding {CONF_GATING_MAX_DURATION_MINUTES} to 720 for NOx tuning."
-                    )
-                    gating = 720
+                # Configure NOx algorithm parameters with defaults if not specified
                 cg.add(
                     var.set_nox_algorithm_tuning(
                         cfg.get(CONF_INDEX_OFFSET, 1),
                         cfg.get(CONF_LEARNING_TIME_OFFSET_HOURS, 12),
                         cfg.get(CONF_LEARNING_TIME_GAIN_HOURS, 12),
-                        gating,
+                        cfg.get(CONF_GATING_MAX_DURATION_MINUTES, 720),
                         cfg.get(CONF_STD_INITIAL, 50),
                         cfg.get(CONF_GAIN_FACTOR, 230),
                     )
                 )
 
     # Handle component-wide settings
+    # Configure temperature compensation if specified
     if CONF_TEMPERATURE_COMPENSATION in config:
         cfg = config[CONF_TEMPERATURE_COMPENSATION]
         cg.add(
@@ -310,7 +316,7 @@ async def to_code(config):
             )
         )
 
-    # Handle temperature acceleration
+    # Handle temperature acceleration parameters
     if CONF_TEMPERATURE_ACCELERATION in config:
         cfg = config[CONF_TEMPERATURE_ACCELERATION]
         cg.add(
@@ -327,18 +333,20 @@ async def to_code(config):
             )
         )
 
-    # Handle Pressure/Altitude
+    # Handle Pressure/Altitude settings
     if CONF_AMBIENT_PRESSURE_HPA in config:
         cg.add(var.set_ambient_pressure(config[CONF_AMBIENT_PRESSURE_HPA]))
 
     if CONF_SENSOR_ALTITUDE_M in config:
         cg.add(var.set_sensor_altitude(config[CONF_SENSOR_ALTITUDE_M]))
 
+    # Configure error handling
     if max_errors := config.get(CONF_MAX_ERRORS_BEFORE_REBOOT):
         cg.add(var.set_max_consecutive_failures(max_errors))
 
 
 # --- Action Registrations ---
+# Base schema for SEN66 actions that only need the component ID
 SEN66_ACTION_BASE_SCHEMA = maybe_simple_id(
     {
         cv.Required(CONF_ID): cv.use_id(SEN66Component),
@@ -350,6 +358,7 @@ SEN66_ACTION_BASE_SCHEMA = maybe_simple_id(
     "sen66.start_fan_cleaning", StartFanAction, SEN66_ACTION_BASE_SCHEMA
 )
 async def sen66_fan_clean_to_code(config, action_id, template_arg, args):
+    """Generate code for the fan cleaning action."""
     paren = await cg.get_variable(config[CONF_ID])
     return cg.new_Pvariable(action_id, template_arg, paren)
 
@@ -358,11 +367,13 @@ async def sen66_fan_clean_to_code(config, action_id, template_arg, args):
     "sen66.activate_sht_heater", ActivateShtHeaterAction, SEN66_ACTION_BASE_SCHEMA
 )
 async def sen66_heater_to_code(config, action_id, template_arg, args):
+    """Generate code for the SHT heater activation action."""
     paren = await cg.get_variable(config[CONF_ID])
     return cg.new_Pvariable(action_id, template_arg, paren)
 
 
 # --- Service/Action Registration for FRC ---
+# Schema for Forced CO2 Recalibration action that requires target concentration
 SEN66_FRC_ACTION_SCHEMA = cv.Schema(  # Schema for the action arguments
     {
         cv.Required(CONF_ID): cv.use_id(SEN66Component),  # Need component ID here
@@ -377,6 +388,7 @@ SEN66_FRC_ACTION_SCHEMA = cv.Schema(  # Schema for the action arguments
     SEN66_FRC_ACTION_SCHEMA,
 )
 async def sen66_frc_to_code(config, action_id, template_arg, args):
+    """Generate code for the forced CO2 recalibration action."""
     paren = await cg.get_variable(config[CONF_ID])  # Get component Pvariable
     var = cg.new_Pvariable(action_id, template_arg, paren)  # Create action Pvariable
     # Get the target concentration argument from the template args
@@ -387,3 +399,14 @@ async def sen66_frc_to_code(config, action_id, template_arg, args):
         var.set_target_co2(template_)
     )  # Set the target_co2 member of the C++ action object
     return var
+
+
+# --- Action Registration for Factory Reset ---
+# Use the base schema as no extra arguments are needed
+@automation.register_action(
+    "sen66.factory_reset", FactoryResetAction, SEN66_ACTION_BASE_SCHEMA
+)
+async def sen66_factory_reset_to_code(config, action_id, template_arg, args):
+    """Generate code for the factory reset action."""
+    paren = await cg.get_variable(config[CONF_ID])
+    return cg.new_Pvariable(action_id, template_arg, paren)

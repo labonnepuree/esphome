@@ -7,6 +7,12 @@
 namespace esphome {
 namespace sen66 {
 
+/**
+ * @brief Action to start the fan cleaning process on the SEN66 sensor.
+ *
+ * This action triggers the fan to run at maximum speed for a short period
+ * to clean the sensor chamber of dust and particles.
+ */
 template<typename... Ts> class StartFanAction : public Action<Ts...> {
  public:
   explicit StartFanAction(SEN66Component *sen66) : sen66_(sen66) {}
@@ -17,6 +23,12 @@ template<typename... Ts> class StartFanAction : public Action<Ts...> {
   SEN66Component *sen66_;
 };
 
+/**
+ * @brief Action to activate the SHT heater on the SEN66 sensor.
+ *
+ * This action turns on the heater element near the humidity sensor
+ * to drive off condensation in high humidity environments.
+ */
 template<typename... Ts> class ActivateShtHeaterAction : public Action<Ts...> {
  public:
   explicit ActivateShtHeaterAction(SEN66Component *sen66) : sen66_(sen66) {}
@@ -27,6 +39,12 @@ template<typename... Ts> class ActivateShtHeaterAction : public Action<Ts...> {
   SEN66Component *sen66_;
 };
 
+/**
+ * @brief Action to perform a forced CO2 recalibration (FRC) on the SEN66 sensor.
+ *
+ * This action allows calibrating the CO2 sensor to a known reference concentration.
+ * The target CO2 concentration is provided as a parameter from the automation.
+ */
 template<typename... Ts> class PerformForcedCo2RecalibrationAction : public Action<Ts...> {
  public:
   explicit PerformForcedCo2RecalibrationAction(SEN66Component *sen66) : sen66_(sen66) {}
@@ -40,6 +58,26 @@ template<typename... Ts> class PerformForcedCo2RecalibrationAction : public Acti
     // Call the component method
     this->sen66_->perform_forced_co2_recalibration(target);
     // Note: Return value (correction factor) is logged in C++ but not directly usable in automation here
+  }
+
+ protected:
+  SEN66Component *sen66_;
+};
+
+/**
+ * @brief Action to perform a factory reset on the SEN66 sensor.
+ *
+ * This action resets the sensor to factory defaults, clearing all calibration
+ * data and learned parameters. Use with caution as this will require the sensor
+ * to relearn environmental conditions.
+ */
+template<typename... Ts> class FactoryResetAction : public Action<Ts...> {
+ public:
+  explicit FactoryResetAction(SEN66Component *sen66) : sen66_(sen66) {}
+
+  void play(Ts... x) override {
+    ESP_LOGD("factory_reset_action", "Triggering factory reset via action.");
+    this->sen66_->factory_reset();
   }
 
  protected:
