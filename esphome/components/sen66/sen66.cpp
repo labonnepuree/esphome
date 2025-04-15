@@ -16,7 +16,7 @@ static const char *const TAG = "sen66";
 
 // Helper function to convert Sensirion int16_t/uint16_t invalid values to NAN
 template<typename T> float sensirion_invalid_to_nan(T value, T invalid_value, float scale = 1.0f) {
-  return value == invalid_value ? NAN : static_cast<float>(value) * scale;
+  return value == invalid_value ? NAN : static_cast<float>(value) / scale;
 }
 
 /** @brief Initialize the sensor, read static info, apply configurations, load state, and start measurement. */
@@ -717,14 +717,14 @@ bool SEN66Component::read_sensor_altitude_(uint16_t &altitude) {
 }
 
 /** @brief Reads humidity and temperature values after heater activation from the sensor. */
-bool SEN66Component::read_sht_heater_measurements_(float &humidity, float &temperature) {
+bool SEN66Component::read_sht_heater_measurements_(int16_t &humidity, int16_t &temperature) {
   int16_t values[2];  // Returns two int16_t
   if (!this->get_register(SEN66_GET_SHT_HEATER_MEASUREMENTS_CMD_ID, (uint16_t *) values, 2, 50)) {
     ESP_LOGW(TAG, "Failed to read SHT heater measurements.");
     return false;
   }
-  humidity = sensirion_invalid_to_nan(values[0], (int16_t) 0x7FFF);
-  temperature = sensirion_invalid_to_nan(values[1], (int16_t) 0x7FFF);
+  humidity = sensirion_invalid_to_nan(values[0], (int16_t) 0x7FFF, 100.0f);
+  temperature = sensirion_invalid_to_nan(values[1], (int16_t) 0x7FFF, 200.0f);
   return true;
 }
 
@@ -1036,7 +1036,7 @@ bool SEN66Component::activate_sht_heater() {
  * Should be called *after* activate_sht_heater completes.
  * @return A pair containing <humidity, temperature> measured during heating, or nullopt on error.
  */
-optional<std::pair<float, float>> SEN66Component::get_sht_heater_measurements() {
+optional<std::pair<int16_t, int16_t>> SEN66Component::get_sht_heater_measurements() {
   // Requires idle mode & FW >= 4.0
   // Note: This function itself doesn't stop measurement, assumes user has ensured idle state
   // if calling manually after activate_sht_heater.
@@ -1056,7 +1056,7 @@ optional<std::pair<float, float>> SEN66Component::get_sht_heater_measurements() 
     return {};
   }
 
-  float humidity, temperature;
+  int16_t humidity, temperature;
   if (!this->read_sht_heater_measurements_(humidity, temperature)) {
     return {};
   }

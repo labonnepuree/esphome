@@ -218,7 +218,7 @@ class SEN66Component : public PollingComponent, public sensirion_common::Sensiri
    * Should be called *after* activate_sht_heater completes.
    * @return A pair containing <humidity, temperature> measured during heating, or nullopt on error.
    */
-  optional<std::pair<float, float>> get_sht_heater_measurements();
+  optional<std::pair<int16_t, int16_t>> get_sht_heater_measurements();
 
   /**
    * @brief Read the current device status register.
@@ -281,7 +281,7 @@ class SEN66Component : public PollingComponent, public sensirion_common::Sensiri
   /** @brief Reads the sensor altitude value from the sensor. */
   bool read_sensor_altitude_(uint16_t &altitude);
   /** @brief Reads humidity and temperature values after heater activation from the sensor. */
-  bool read_sht_heater_measurements_(float &humidity, float &temperature);
+  bool read_sht_heater_measurements_(int16_t &humidity, int16_t &temperature);
   /** @brief Generic helper to read either VOC or NOx tuning parameters. */
   bool read_tuning_parameters_(uint16_t i2c_command, GasTuning &tuning);
   /** @brief Internal helper to read device status (with or without clearing). */
