@@ -1154,10 +1154,11 @@ void SEN66Component::factory_reset() {
     if (!global_preferences->reset()) {
       ESP_LOGW(TAG, "Failed to clear VOC algorithm state from preferences during factory reset.");
     }
+    this->pref_ = nullptr;
   }
 
-  ESP_LOGI(TAG, "Factory reset command sent successfully. Rebooting component...");
-  this->setup();
+  ESP_LOGI(TAG, "Factory reset command sent successfully. Waiting for component to restart...");
+  this->mark_failed();
 }
 
 }  // namespace sen66
