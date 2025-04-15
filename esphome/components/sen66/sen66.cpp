@@ -21,6 +21,8 @@ template<typename T> float sensirion_invalid_to_nan(T value, T invalid_value, fl
 
 /** @brief Initialize the sensor, read static info, apply configurations, load state, and start measurement. */
 void SEN66Component::setup() {
+  delay(1000);
+
   ESP_LOGCONFIG(TAG, "Setting up SEN66...");
   // --- Initial State Setup ---
   this->original_interval_before_action_ = 0;  // Reset stored interval, not relevant here yet.
@@ -767,10 +769,10 @@ optional<GasTuning> SEN66Component::get_nox_algorithm_tuning() {
 /** @brief Set temperature acceleration parameters from YAML configuration. */
 void SEN66Component::set_temperature_acceleration_parameters(float k, float p, float t1, float t2) {
   TemperatureAcceleration params;
-  params.k = static_cast<uint16_t>(roundf(k * 10));
-  params.p = static_cast<uint16_t>(roundf(p * 10));
-  params.t1 = static_cast<uint16_t>(roundf(t1 * 10));
-  params.t2 = static_cast<uint16_t>(roundf(t2 * 10));
+  params.k = static_cast<uint16_t>(std::round(k * 10));
+  params.p = static_cast<uint16_t>(std::round(p * 10));
+  params.t1 = static_cast<uint16_t>(std::round(t1 * 10));
+  params.t2 = static_cast<uint16_t>(std::round(t2 * 10));
   this->temp_accel_params_ = params;
   // Actual writing happens during setup() if called before, or needs separate trigger if called after.
   // For simplicity, we assume it's set in YAML and applied during setup.
@@ -1134,8 +1136,8 @@ void SEN66Component::set_temperature_compensation(float offset, float normalized
     return;
   }
   TemperatureCompensation temp_comp;
-  temp_comp.offset = static_cast<int16_t>(roundf(offset * 200));
-  temp_comp.normalized_offset_slope = static_cast<int16_t>(roundf(normalized_offset_slope * 10000));
+  temp_comp.offset = static_cast<int16_t>(std::round(offset * 200));
+  temp_comp.normalized_offset_slope = static_cast<int16_t>(std::round(normalized_offset_slope * 10000));
   temp_comp.time_constant = time_constant;
   temp_comp.slot = slot;                // Store the slot
   this->temp_comp_params_ = temp_comp;  // Store the parameters

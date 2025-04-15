@@ -242,8 +242,8 @@ CONFIG_SCHEMA = (
             # Component-Wide Configuration Settings: Optional blocks for global settings.
             cv.Optional(CONF_TEMPERATURE_COMPENSATION): cv.Schema(
                 {
-                    cv.Optional(CONF_OFFSET, default=0.0): cv.float_,
-                    cv.Optional(CONF_NORMALIZED_OFFSET_SLOPE, default=0.0): cv.float_,
+                    cv.Optional(CONF_OFFSET, default=0): cv.float_,
+                    cv.Optional(CONF_NORMALIZED_OFFSET_SLOPE, default=0): cv.float_,
                     cv.Optional(CONF_TIME_CONSTANT, default=0): cv.positive_int,
                     cv.Optional(CONF_SLOT, default=0): cv.int_range(0, 4),
                 }
