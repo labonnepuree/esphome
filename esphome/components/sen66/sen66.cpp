@@ -1151,31 +1151,13 @@ void SEN66Component::factory_reset() {
 
   if (this->voc_sensor_) {
     ESP_LOGD(TAG, "Clearing saved VOC algorithm state from preferences due to factory reset...");
-    uint8_t default_state[8] = {0};
-    if (!this->pref_.save(&default_state)) {
+    if (!global_preferences->reset()) {
       ESP_LOGW(TAG, "Failed to clear VOC algorithm state from preferences during factory reset.");
-      // Continue with reset process regardless
-    } else {
-      ESP_LOGD(TAG, "Cleared VOC algorithm state from preferences.");
     }
   }
 
-  ESP_LOGD(TAG, "Sending device reset command...");
-  if (!this->write_command(SEN66_DEVICE_RESET_CMD_ID)) {
-    ESP_LOGE(TAG, "Failed to send factory reset command.");
-    // Try to restart measurement anyway, as the state might be recoverable
-    this->handle_action_completion_(false);  // Indicate the reset command itself failed
-    return;
-  }
-
-  ESP_LOGI(TAG, "Factory reset command sent successfully. Sensor will reboot.");
-  // Wait for the sensor to reboot before attempting to restart measurements
-  this->set_timeout("factory_reset_wait", 2500, [this]() {
-    ESP_LOGD(TAG, "Post-factory reset: Handling action completion.");
-    // On next boot, setup() will try to load state from prefs (which are now cleared/default)
-    // and write that default state to the sensor if needed.
-    this->handle_action_completion_(true);  // Indicate reset command succeeded
-  });
+  ESP_LOGI(TAG, "Factory reset command sent successfully. Rebooting component...");
+  this->setup();
 }
 
 }  // namespace sen66
