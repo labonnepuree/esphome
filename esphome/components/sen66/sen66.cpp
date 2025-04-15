@@ -320,6 +320,53 @@ void SEN66Component::update() {
     return;
   }
 
+  // --- Add error handling wrapper ---
+  bool update_successful = true;  // Assume success initially
+
+  // --- Read and Clear Device Status Early ---
+  // Reading status first helps diagnose issues before attempting data reads.
+  // Clearing avoids repeated warnings for the same latched error.
+  optional<sen66_device_status> status_opt = this->read_and_clear_device_status();
+  if (status_opt.has_value()) {
+    sen66_device_status status = status_opt.value();
+    // Check for specific error flags using the status struct
+    if (status.bits.fan_error) {
+      ESP_LOGW(TAG, "Device status indicates Fan Error!");
+      this->status_set_warning();
+      update_successful = false;
+    }
+    if (status.bits.rht_error) {
+      ESP_LOGW(TAG, "Device status indicates RHT Communication Error!");
+      this->status_set_warning();
+      update_successful = false;
+    }
+    if (status.bits.gas_error) {
+      ESP_LOGW(TAG, "Device status indicates Gas Sensor (VOC/NOx) Error!");
+      this->status_set_warning();
+      update_successful = false;
+    }
+    if (status.bits.co2_2_error) {
+      ESP_LOGW(TAG, "Device status indicates CO2 Sensor Error!");
+      this->status_set_warning();
+      update_successful = false;
+    }
+    if (status.bits.pm_error) {
+      ESP_LOGW(TAG, "Device status indicates PM (Laser) Sensor Error!");
+      this->status_set_warning();
+      update_successful = false;
+    }
+    if (status.bits.fan_speed_warning) {
+      ESP_LOGW(TAG, "Device status indicates Fan Speed Warning (Low/High)!");
+      this->status_set_warning();
+      // Treat warning as potential failure indication too
+      update_successful = false;
+    }
+  } else {
+    ESP_LOGW(TAG, "Failed to read device status during update.");
+    this->status_set_warning();
+    update_successful = false;  // Failed communication counts as failure
+  }
+
   // --- Stabilization Check ---
   // Determine if we are in the stabilization period after starting measurement.
   // During this time, we read data to warm up but don't publish.
@@ -329,9 +376,6 @@ void SEN66Component::update() {
              this->next_update_allowed_time_ - millis());
     // Don't return; proceed to read data.
   }
-
-  // --- Add error handling wrapper ---
-  bool update_successful = true;  // Assume success initially
 
   // Check if data is ready
   uint16_t data_ready_word = 0;
@@ -351,7 +395,7 @@ void SEN66Component::update() {
     return;  // Exit normally
   }
 
-  if (update_successful) {  // Only try reading measurements if data ready check passed
+  if (update_successful) {  // Only try reading measurements if data ready check and status check passed
     // --- Read Mass Concentration & Gas Block ---
     uint16_t mass_gas_values[9];
     if (!this->write_command(SEN66_READ_MEASURED_VALUES_AS_INTEGERS_CMD_ID)) {
