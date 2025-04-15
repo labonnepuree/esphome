@@ -272,10 +272,6 @@ class SEN66Component : public PollingComponent, public sensirion_common::Sensiri
   bool write_sensor_altitude_(uint16_t altitude);
 
   // --- Internal I2C Read Helpers ---
-  /** @brief Reads VOC tuning parameters from the sensor. */
-  bool read_voc_tuning_parameters_(GasTuning &tuning);
-  /** @brief Reads NOx tuning parameters from the sensor. */
-  bool read_nox_tuning_parameters_(GasTuning &tuning);
   /** @brief Reads the VOC algorithm state from the sensor. */
   bool read_voc_algorithm_state_(uint8_t state[8]);
   /** @brief Reads the CO2 Automatic Self-Calibration status from the sensor. */

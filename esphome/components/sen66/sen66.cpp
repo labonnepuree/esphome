@@ -1260,5 +1260,35 @@ void SEN66Component::factory_reset() {
   App.safe_reboot();
 }
 
+/** @brief Set VOC algorithm tuning parameters from YAML configuration. */
+void SEN66Component::set_voc_algorithm_tuning(int16_t index_offset, int16_t learning_time_offset_hours,
+                                              int16_t learning_time_gain_hours, int16_t gating_max_duration_minutes,
+                                              int16_t std_initial, int16_t gain_factor) {
+  GasTuning params;
+  params.index_offset = index_offset;
+  params.learning_time_offset_hours = learning_time_offset_hours;
+  params.learning_time_gain_hours = learning_time_gain_hours;
+  params.gating_max_duration_minutes = gating_max_duration_minutes;
+  params.std_initial = std_initial;
+  params.gain_factor = gain_factor;
+  this->voc_tuning_params_ = params;
+  ESP_LOGD(TAG, "VOC tuning parameters queued for setup.");
+}
+
+/** @brief Set NOx algorithm tuning parameters from YAML configuration. */
+void SEN66Component::set_nox_algorithm_tuning(int16_t index_offset, int16_t learning_time_offset_hours,
+                                              int16_t learning_time_gain_hours, int16_t gating_max_duration_minutes,
+                                              int16_t std_initial, int16_t gain_factor) {
+  GasTuning params;
+  params.index_offset = index_offset;
+  params.learning_time_offset_hours = learning_time_offset_hours;
+  params.learning_time_gain_hours = learning_time_gain_hours;
+  params.gating_max_duration_minutes = gating_max_duration_minutes;
+  params.std_initial = std_initial;
+  params.gain_factor = gain_factor;
+  this->nox_tuning_params_ = params;
+  ESP_LOGD(TAG, "NOx tuning parameters queued for setup.");
+}
+
 }  // namespace sen66
 }  // namespace esphome
